@@ -14,6 +14,7 @@ Built and verified on: Chrome 148.0.7778.96, Python 3.12, Linux 6.12.
 |---|---|
 | `selftest_hid.py` — CTAP2 core over real CTAPHID framing | **36 passed, 0 failed** |
 | `selftest_e2e.py` — register → authenticate → RP verification | **21 passed, 0 failed** |
+| `selftest_uhid.py` — uhid ABI, descriptor, CTAP2-over-HID | **26 passed, 0 failed** |
 | `drive_browser.py` — live Chrome ceremony against the lab RP | **verified, signCount 1 → 2** |
 
 Live browser run:
@@ -58,6 +59,45 @@ UP/UV flags, clientDataHash binding, origin scoping, and the full CTAPHID wire f
 
 ---
 
+## Any browser: bind at the OS level with uhid
+
+The DevTools path above needs Chrome and browser flags. To be **browser-agnostic**,
+expose the authenticator as a **real HID device** on the FIDO usage page via
+`/dev/uhid`. Every browser that speaks WebAuthn then discovers it natively — no flags,
+no extension, no profile injection.
+
+```bash
+sudo modprobe uhid                      # once; needs CONFIG_INPUT_UHID=y
+cd src
+PYTHONPATH=../libs python3 uhid_ctap.py --store ./creds.json
+```
+
+Then open **any** browser, go to your site, choose "security key". Confirm the OS sees it:
+
+```bash
+lsusb | grep -i fido
+cat /sys/class/hid/hidraw*/device/uevent | grep HID_NAME
+```
+
+**Why uhid rather than the USB gadget stack:** gadget mode needs a UDC (a real USB
+device controller) and root on the host bus. `uhid` is a userspace HID driver — it
+registers a virtual HID device through the normal input subsystem with no bus, no
+root, and no browser cooperation. `uhid_ctap.py` declares the FIDO usage page
+(`0xF1D0` / usage `0x01`), 64-byte reports, and the FIDO Alliance demo VID/PID
+(`0xF1D0:0x0001`) — which is what makes the browser treat it as an authenticator.
+
+**Verification status — read this before you rely on it.** The uhid ABI layer
+(struct framing, `uhid_create` layout, report descriptor, CTAP2-over-HID round trip)
+is covered by `selftest_uhid.py` — 26 tests, all passing. The **ioctl against a live
+uhid driver could not be executed here**: this build ran in a container whose host
+kernel has no uhid driver and no module loader, so `uhid_ctap.py` here exits with an
+explicit diagnostic rather than a fake success. Run it on a normal host with
+`CONFIG_INPUT_UHID=y` to confirm the kernel handoff. Everything above the HID layer —
+CTAP2 core, CTAPHID framing, registration, authentication, RP verification — is
+verified end to end.
+
+---
+
 ## Layout
 
 | File | Role |
@@ -71,7 +111,8 @@ UP/UV flags, clientDataHash binding, origin scoping, and the full CTAPHID wire f
 | `rp_verify.py` | The RP side: challenge/origin/rpId/flags/counter/attestation |
 | `analyze_attestation.py` | What an RP can learn from an attestation statement |
 | `hid_gadget.sh` | USB HID gadget descriptor on the FIDO usage page |
-| `selftest_hid.py`, `selftest_e2e.py` | Test suites |
+| `uhid_ctap.py` | **Any-browser path** — binds the key to the OS via `/dev/uhid` |
+| `selftest_hid.py`, `selftest_e2e.py`, `selftest_uhid.py` | Test suites (83 total) |
 
 ---
 
