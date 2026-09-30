@@ -20,9 +20,16 @@ async def main():
 
     with urllib.request.urlopen(f"{DEV}/json/list", timeout=8) as r:
         targets = json.load(r)
-    page = next((t for t in targets if t.get("type") == "page"), None)
+    # Must be a real web page. devtools:// targets are UI surfaces, not browsing
+    # contexts, and an authenticator bound to one is invisible to any site.
+    def _usable(t):
+        url = t.get("url") or ""
+        return (t.get("type") == "page"
+                and not url.startswith("devtools://")
+                and not url.startswith("chrome-"))
+    page = next((t for t in targets if _usable(t)), None)
     if not page:
-        print("no page target"); sys.exit(1)
+        print("no usable page target"); sys.exit(1)
     print(f"attached to: {page['id']}  {page['url']}")
 
     async with websockets.connect(page["webSocketDebuggerUrl"], max_size=None) as ws:
