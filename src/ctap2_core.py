@@ -35,7 +35,8 @@ CTAP2_ERR = {
     0x12: "CTAP2_ERR_INVALID_CBOR",
     0x14: "CTAP2_ERR_MISSING_PARAMETER",
     0x15: "CTAP2_ERR_LIMIT_EXCEEDED",
-    0x16: "CTAP2_ERR_UNSUPPORTED_EXTENSION",
+    0x17: "CTAP2_ERR_FP_DATABASE_FULL",
+    0x18: "CTAP2_ERR_LARGE_BLOB_STORAGE_FULL",
     0x19: "CTAP2_ERR_CREDENTIAL_EXCLUDED",
     0x21: "CTAP2_ERR_PROCESSING",
     0x22: "CTAP2_ERR_INVALID_CREDENTIAL",
@@ -45,27 +46,30 @@ CTAP2_ERR = {
     0x26: "CTAP2_ERR_UNSUPPORTED_ALGORITHM",
     0x27: "CTAP2_ERR_OPERATION_DENIED",
     0x28: "CTAP2_ERR_KEY_STORE_FULL",
-    0x2B: "CTAP2_ERR_NO_OPERATION_PENDING",
-    0x2C: "CTAP2_ERR_UNSUPPORTED_OPTION",
-    0x2D: "CTAP2_ERR_INVALID_OPTION",
-    0x2E: "CTAP2_ERR_KEEPALIVE_CANCEL",
-    0x2F: "CTAP2_ERR_NO_CREDENTIALS",
-    0x30: "CTAP2_ERR_USER_ACTION_TIMEOUT",
-    0x31: "CTAP2_ERR_NOT_ALLOWED",
-    0x32: "CTAP2_ERR_PIN_INVALID",
-    0x33: "CTAP2_ERR_PIN_BLOCKED",
-    0x34: "CTAP2_ERR_PIN_AUTH_INVALID",
-    0x35: "CTAP2_ERR_PIN_AUTH_BLOCKED",
-    0x36: "CTAP2_ERR_PIN_NOT_SET",
-    0x37: "CTAP2_ERR_PUAT_REQUIRED",
-    0x38: "CTAP2_ERR_PIN_POLICY_VIOLATION",
+    0x2B: "CTAP2_ERR_UNSUPPORTED_OPTION",
+    0x2C: "CTAP2_ERR_INVALID_OPTION",
+    0x2D: "CTAP2_ERR_KEEPALIVE_CANCEL",
+    0x2E: "CTAP2_ERR_NO_CREDENTIALS",
+    0x2F: "CTAP2_ERR_USER_ACTION_TIMEOUT",
+    0x30: "CTAP2_ERR_NOT_ALLOWED",
+    0x31: "CTAP2_ERR_PIN_INVALID",
+    0x32: "CTAP2_ERR_PIN_BLOCKED",
+    0x33: "CTAP2_ERR_PIN_AUTH_INVALID",
+    0x34: "CTAP2_ERR_PIN_AUTH_BLOCKED",
+    0x35: "CTAP2_ERR_PIN_NOT_SET",
+    0x36: "CTAP2_ERR_PUAT_REQUIRED",
+    0x37: "CTAP2_ERR_PIN_POLICY_VIOLATION",
+    0x38: "CTAP2_ERR_PIN_TOKEN_EXPIRED",
     0x39: "CTAP2_ERR_REQUEST_TOO_LARGE",
     0x3A: "CTAP2_ERR_ACTION_TIMEOUT",
     0x3B: "CTAP2_ERR_UP_REQUIRED",
     0x3C: "CTAP2_ERR_UV_BLOCKED",
+    0x3D: "CTAP2_ERR_INTEGRITY_FAILURE",
+    0x3E: "CTAP2_ERR_INVALID_SUBCOMMAND",
+    0x3F: "CTAP2_ERR_UV_INVALID",
+    0x40: "CTAP2_ERR_UNAUTHORIZED_PERMISSION",
     0x7F: "CTAP1_ERR_OTHER",
 }
-
 # authenticator data flag bits
 FLAG_UP = 0x01
 FLAG_UV = 0x04
@@ -244,15 +248,16 @@ class AttestationCa:
     def generate(common_name: str, aaguid: bytes) -> "AttestationCa":
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         subject = x509_name(common_name)
+        now = _now()
         cert = (
             x509_builder()
             .subject_name(subject)
             .issuer_name(subject)          # self-signed root
             .public_key(key.public_key())
-            .serial_number(0x476F4F4C46444)
-            .not_valid_before(_epoch(1500000000))
-            .not_valid_after(_epoch(1500000000 + 60 * 60 * 24 * 365 * 10))
-            .add_extension(basic_constraints_ca(), critical=True)
+            .serial_number(x509_random_serial())
+            .not_valid_before(now - _days(1))
+            .not_valid_after(now + _days(3650))
+            .add_extension(basic_constraints(True), critical=True)
             .sign(key, hashes.SHA256())
         )
         return AttestationCa(
@@ -275,24 +280,33 @@ class AttestationCa:
         """
         key = serialization.load_pem_private_key(self.root_key_pem.encode(), password=None)
         root = _certlib().load_der_x509_certificate(self.root_cert_der)
+        now = _now()
         return (
             x509_builder()
             .subject_name(x509_name("Batch Attestation"))
             .issuer_name(root.subject)        # issued BY the root, not itself
             .public_key(serialization.load_der_public_key(credential_pub_der))
-            .serial_number(serial)
-            .not_valid_before(_epoch(1500000000))
-            .not_valid_after(_epoch(1500000000 + 60 * 60 * 24 * 90))
-            .add_extension(basic_constraints_ca(), critical=False)
+            .serial_number(serial or x509_random_serial())
+            .not_valid_before(now - _days(1))
+            .not_valid_after(now + _days(365))
+            .add_extension(basic_constraints(False), critical=True)
             .add_extension(fido_aaguid_extension(self.aaguid), critical=False)
             .sign(key, hashes.SHA256())
         ).public_bytes(serialization.Encoding.DER)
 
 
-def _epoch(ts: int):
-    """cryptography >= 42 wants datetime, not struct_time."""
+def _now():
     from datetime import datetime, timezone
-    return datetime.fromtimestamp(ts, tz=timezone.utc)
+    return datetime.now(timezone.utc)
+
+
+def _days(value: int):
+    from datetime import timedelta
+    return timedelta(days=value)
+
+
+def x509_random_serial() -> int:
+    return _certlib().random_serial_number()
 
 
 def _certlib():
@@ -316,9 +330,9 @@ def x509_builder():
     return x.CertificateBuilder()
 
 
-def basic_constraints_ca():
+def basic_constraints(is_ca: bool):
     x = _certlib()
-    return x.BasicConstraints(ca=True, path_length=None)
+    return x.BasicConstraints(ca=is_ca, path_length=None)
 
 
 def fido_aaguid_extension(aaguid: bytes):
@@ -361,7 +375,7 @@ class Ctap2Authenticator:
     aaguid: bytes = b"\x00" * 16
     attestation_mode: str = "packed_x5c"   # none | packed_self | packed_x5c
     up_gate: Callable[[], bool] = lambda: True
-    uv_gate: Callable[[], bool] = lambda: True
+    uv_gate: Optional[Callable[[], bool]] = None
     _credentials: dict = field(default_factory=dict)
     _pin: Optional[bytes] = None
     _pin_hash: Optional[bytes] = None
@@ -397,6 +411,7 @@ class Ctap2Authenticator:
                 )
         if self._ca is None:
             self._ca = AttestationCa.generate("Batch Certificate", self.aaguid)
+        self.aaguid = self._ca.aaguid
 
     def save(self):
         """Atomic write — a half-flushed credential store means unregistered keys."""
@@ -425,7 +440,7 @@ class Ctap2Authenticator:
 
     def set_pin(self, pin: str):
         if len(pin) < MIN_PIN_LEN:
-            raise CtapError(0x38, "pin too short")
+            raise CtapError(0x37, "pin too short")
         self._pin = pin.encode()
         self._pin_hash = hashlib.sha256(self._pin).digest()[:16]
         self._pin_retries = MAX_PIN_RETRY
@@ -433,7 +448,7 @@ class Ctap2Authenticator:
 
     def verify_pin(self, pin: str) -> bool:
         if self._pin_hash is None:
-            raise CtapError(0x36, "pin not set")
+            raise CtapError(0x35, "pin not set")
         got = hashlib.sha256(pin.encode()).digest()[:16]
         ok = hmac.compare_digest(got, self._pin_hash)
         if ok:
@@ -441,14 +456,16 @@ class Ctap2Authenticator:
         else:
             self._pin_retries -= 1
             if self._pin_retries == 0:
-                raise CtapError(0x33, "pin blocked")
+                raise CtapError(0x32, "pin blocked")
         self.save()
         return ok
 
     # ---------------------------------------------------------------- user verification
 
     def _uv(self) -> None:
-        """Internal UV. Real hardware reads a finger; here the gate decides."""
+        """Perform explicitly configured internal user verification."""
+        if self.uv_gate is None:
+            raise CtapError(0x2C, "internal user verification is not configured")
         if self._uv_blocked:
             raise CtapError(0x3C, "uv blocked")
         if not self.uv_gate():
@@ -465,25 +482,25 @@ class Ctap2Authenticator:
     # ---------------------------------------------------------------- CTAP commands
 
     def get_info(self) -> dict:
+        options = {
+            "rk": True,
+            "up": True,
+        }
+        if self.uv_gate is not None:
+            options["uv"] = True
         return {
-            1:  [ALG_ES256, ALG_RS256, ALG_EDDSA],
-            2:  32,                                  # maxMsgSize
-            3:  1,                                   # pinUvAuthProtocols count
-            4:  list(self.pin_uv_auth_protocols),
-            5:  MAX_PIN_RETRY,
-            6:  MAX_UV_RETRY,
-            7:  64,                                  # maxCredentialIdLength
-            8:  32,                                  # maxCredentialIdLength (legacy slot)
-            9:  [{"type": "public-key", "alg": ALG_ES256}],   # algorithms
-            0x0A: [{"id": "hmac-secret", "version": 2},
-                   {"id": "credBlob", "version": 1}],       # extensions
-            0x0B: 3,                                 # maxAuthenticatorConfigLength
-            0x0C: {"rk": True, "up": True, "clientPin": self._pin is not None, "pinUvAuthToken": True},
-            0x0D: 2,                                 # maxUvAttemptsPerMakeCredential
-            0x0E: 1,
+            1: ["FIDO_2_0"],
+            2: [],
+            3: self.aaguid,
+            4: options,
+            5: 1200,
+            7: 64,
+            8: 64,
+            10: [{"type": "public-key", "alg": ALG_ES256}],
         }
 
     def reset(self):
+        self._up()
         self._credentials.clear()
         self._pin = None
         self._pin_hash = None
@@ -512,12 +529,13 @@ class Ctap2Authenticator:
         pub_key_param = req.get("pubKeyCredParams", [])
 
         options = req.get("options") or {}
+        extensions = req.get("extensions") or {}
         pin_auth = req.get("pinUvAuthParam")
-
-        # rk / uv / credProtect all live under `options` (key 0x07), not at the
-        # top level — reading them off the request root silently yields rk=False.
         want_rk = bool(options.get("rk", False))
-        want_uv = bool(options.get("uv", True))
+        want_uv = bool(options.get("uv", False))
+
+        if pin_auth is not None:
+            raise CtapError(0x33, "PIN/UV protocol is not implemented")
 
         if not any(p.get("alg") == ALG_ES256 for p in pub_key_param):
             raise CtapError(0x26, "no ES256 offered")
@@ -525,13 +543,15 @@ class Ctap2Authenticator:
             ex_id = ex.get("id")
             if isinstance(ex_id, str):
                 ex_id = bytes.fromhex(ex_id)
-            if ex_id and ex_id in self._credentials:
+            credential = self._credentials.get(ex_id) if ex_id else None
+            if credential is not None and credential.rp_id == rp_id:
                 raise CtapError(0x19, "credential already exists for this user")
 
         self._up()
-        uv = self._pin is not None or want_uv
-        if uv:
+        uv = False
+        if want_uv:
             self._uv()
+            uv = True
 
         key = ec.generate_private_key(ec.SECP256R1())
         pem = key.private_bytes(
@@ -539,17 +559,22 @@ class Ctap2Authenticator:
             serialization.PrivateFormat.PKCS8,
             serialization.NoEncryption(),
         ).decode()
+        user_handle = user["id"]
+        if isinstance(user_handle, str):
+            user_handle = bytes.fromhex(user_handle)
+        if not isinstance(user_handle, bytes):
+            raise CtapError(0x11, "user.id must be a byte string")
         cred = Credential(
             credential_id=os.urandom(32),
             rp_id=rp_id,
-            user_handle=bytes.fromhex(user["id"]),
+            user_handle=user_handle,
             user_name=user.get("name", ""),
             user_display_name=user.get("displayName", ""),
             private_key_pem=pem,
             sign_count=0,
             is_resident=want_rk,
-            cred_protect=req.get("credProtect", "userVerificationOptional"),
-            cred_lg=req.get("credBlob"),
+            cred_protect=extensions.get("credProtect", "userVerificationOptional"),
+            cred_blob=extensions.get("credBlob"),
             hmac_secret=os.urandom(32),
         )
         self._credentials[cred.credential_id] = cred
@@ -574,11 +599,10 @@ class Ctap2Authenticator:
         # NOT a response field — it is the trailing bytes of authData, which the
         # client parses out. Putting it in the map would be a spec violation.
         return {
-            "fmt": fmt,
-            "authData": att_data,
-            "attStmt": att_stmt,
-            "epAtt": False,
-            "largeBlobKey": None,
+            1: fmt,
+            2: att_data,
+            3: att_stmt,
+            4: False,
         }
 
     def _attest(self, auth_data_with_hash: bytes, cred: Credential):
@@ -591,7 +615,6 @@ class Ctap2Authenticator:
             return "packed", {
                 "alg": ALG_ES256,
                 "sig": sig,
-                "x5c": [],
             }
         leaf = self._ca.issue_leaf(cred.public_key_der(), serial=len(self._credentials))
         sig = key.sign(auth_data_with_hash, ec.ECDSA(hashes.SHA256()))
@@ -618,12 +641,15 @@ class Ctap2Authenticator:
                 if cid and cid in self._credentials and self._credentials[cid].rp_id_hash() == rp_id_hash:
                     matches.append(self._credentials[cid])
             if not matches:
-                raise CtapError(0x2F, "no credential in allowList for this rpId")
+                raise CtapError(0x2E, "no credential in allowList for this rpId")
             cred = matches[0]
         else:
-            resident = [c for c in self._credentials.values() if c.rp_id_hash() == rp_id_hash]
+            resident = [
+                c for c in self._credentials.values()
+                if c.is_resident and c.rp_id_hash() == rp_id_hash
+            ]
             if not resident:
-                raise CtapError(0x2F, "no resident credential for rpId")
+                raise CtapError(0x2E, "no resident credential for rpId")
             self._up()
             cred = self._select_credential(resident)
 
@@ -632,9 +658,13 @@ class Ctap2Authenticator:
 
         self._up()
         opts = req.get("options") or {}
-        uv = self._pin is not None or bool(opts.get("uv", True))
-        if uv:
+        pin_auth = req.get("pinUvAuthParam")
+        if pin_auth is not None:
+            raise CtapError(0x33, "PIN/UV protocol is not implemented")
+        uv = False
+        if bool(opts.get("uv", False)):
             self._uv()
+            uv = True
 
         cred.sign_count += 1
         flags = FLAG_UP
@@ -646,28 +676,25 @@ class Ctap2Authenticator:
             flags |= FLAG_BS
 
         user_sel = req.get("user")
-        # CTAP2.1 §6.2: response keys are 1=credentialId, 2=authData, 3=signature,
-        # 4=user, 5=numberOfCredentials. The user entity is public data, so it
-        # travels as bytes — NOT hex strings the way makeCredential receives it.
+        # CTAP2 uses a credential descriptor at key 1 and a byte-string user ID.
+        # Identifying user names are disclosed only after user verification.
         resp_user = None
         if cred.is_resident or user_sel is not None:
-            resp_user = {
-                "id": cred.user_handle,
-                "name": cred.user_name,
-                "displayName": cred.user_display_name,
-            }
+            resp_user = {"id": cred.user_handle}
+            if uv:
+                resp_user.update({"name": cred.user_name,
+                                  "displayName": cred.user_display_name})
         att_data = build_auth_data(rp_id_hash, flags, cred.sign_count)
         sig = cred.private_key().sign(
             att_data + client_data_hash, ec.ECDSA(hashes.SHA256())
         )
         out = {
-            1: cred.credential_id,
+            1: {"type": "public-key", "id": cred.credential_id},
             2: att_data,
             3: sig,
-            4: resp_user,
-            5: len([c for c in self._credentials.values()
-                    if c.rp_id_hash() == rp_id_hash]),
         }
+        if resp_user is not None:
+            out[4] = resp_user
         self.save()
         return out
 
@@ -675,8 +702,8 @@ class Ctap2Authenticator:
         # *a real key with 2 accounts shows a picker; the gate is where that UI plugs in.*
         if len(resident) == 1:
             return resident[0]
-        self._up()
-        return resident[0]
+        # ponytail: no account picker; reject ambiguity until one is implemented.
+        raise CtapError(0x27, "multiple discoverable credentials require an allowList")
 
     def get_key_agreement(self) -> dict:
         key = ec.generate_private_key(ec.SECP256R1())
@@ -691,14 +718,14 @@ class Ctap2Authenticator:
 
     def get_pin_token(self, pin_protocol: int, key_agreement_cbor: bytes) -> dict:
         if self._pin is None:
-            raise CtapError(0x36, "pin not set")
+            raise CtapError(0x35, "pin not set")
         pub = parse_cose_public(key_agreement_cbor)
         x = self._ecdh_key.exchange(ec.ECDH(), pub)
         shared = x.to_bytes(32, "big")
         try:
             self.verify_pin(self._pin.decode())
         except CtapError:
-            raise CtapError(0x33 if self._pin_retries == 0 else 0x31, "pin rejected")
+            raise CtapError(0x32 if self._pin_retries == 0 else 0x31, "pin rejected")
         pin_token_enc = os.urandom(16)
         if pin_protocol == 1:
             pin_token = hmac.new(self._pin_hash, pin_token_enc, hashlib.sha256).digest()[:16]

@@ -14,7 +14,7 @@ from typing import Optional
 import cbor2
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ec import ECDSA
 
@@ -32,7 +32,9 @@ POLICY = {
     # When require_attestation is on, the attestation root must terminate at a
     # *recognised* FIDO attestation CA. A locally generated root is not, and that
     # is the check that actually stops a software authenticator.
-    "trusted_attestation_cns": [],
+    "trusted_attestation_cns": [],  # deprecated: names are not trust anchors
+    "trusted_attestation_root_sha256": [],
+    "trusted_attestation_root_certificates": [],
 }
 
 # Attestation roots/issuers that appear in genuine vendor attestation chains.
@@ -60,6 +62,8 @@ def verify_registration(
     client_data: bytes,
     attestation_response: dict,
     expected_challenge: bytes,
+    *,
+    expected_origin: str,
     policy: dict = None,
 ) -> dict:
     """
@@ -71,7 +75,9 @@ def verify_registration(
     policy = {**POLICY, **(policy or {})}
     client_data_hash = hashlib.sha256(client_data).digest()
 
-    _check_client_data(client_data, expected_challenge, "webauthn.create")
+    _check_client_data(
+        client_data, expected_challenge, "webauthn.create", expected_origin
+    )
 
     auth_data = attestation_response["authData"]
     flags = auth_data[32]
@@ -117,6 +123,8 @@ def verify_assertion(
     stored_public_key_der: bytes,
     stored_sign_count: int,
     expected_challenge: bytes,
+    *,
+    expected_origin: str,
     policy: dict = None,
 ) -> dict:
     """
@@ -126,9 +134,15 @@ def verify_assertion(
     """
     policy = {**POLICY, **(policy or {})}
     client_data_hash = hashlib.sha256(client_data).digest()
-    _check_client_data(client_data, expected_challenge, "webauthn.get")
+    _check_client_data(
+        client_data, expected_challenge, "webauthn.get", expected_origin
+    )
 
-    credential_id = assertion_response[1]
+    descriptor = assertion_response[1]
+    if not isinstance(descriptor, dict) or descriptor.get("type") != "public-key" \
+            or not isinstance(descriptor.get("id"), bytes):
+        raise RpError("invalid assertion credential descriptor")
+    credential_id = descriptor["id"]
     auth_data = assertion_response[2]
     signature = assertion_response[3]
     user = assertion_response.get(4)
@@ -171,7 +185,12 @@ def verify_assertion(
 # --------------------------------------------------------------------------- internals
 
 
-def _check_client_data(client_data: bytes, expected_challenge: bytes, expected_type: str):
+def _check_client_data(
+    client_data: bytes,
+    expected_challenge: bytes,
+    expected_type: str,
+    expected_origin: str,
+):
     try:
         parsed = json.loads(client_data.decode())
     except Exception as exc:
@@ -180,6 +199,13 @@ def _check_client_data(client_data: bytes, expected_challenge: bytes, expected_t
         raise RpError(
             f"expected ceremony {expected_type!r}, got {parsed.get('type')!r}"
         )
+    if parsed.get("origin") != expected_origin:
+        raise RpError(
+            f"clientData origin {parsed.get('origin')!r} does not match "
+            f"expected origin {expected_origin!r}"
+        )
+    if parsed.get("crossOrigin") is True:
+        raise RpError("cross-origin WebAuthn ceremonies are not allowed")
     import base64
     challenge = base64.urlsafe_b64decode(parsed["challenge"] + "==")
     if challenge != expected_challenge:
@@ -257,31 +283,28 @@ def _verify_attestation_statement(fmt: str, stmt: dict, signed_data: bytes,
     except Exception as exc:
         raise RpError(f"attestation signature could not be checked: {exc}")
 
+    if chain_kind == "self" and policy["require_attestation"]:
+        raise RpError("attestation policy requires a pinned certificate chain")
+
     if chain_kind == "x5c" and policy["require_attestation"]:
         cn = _common_name(leaf)
         if cn in policy["rejected_cert_common_names"]:
             raise RpError(f"attestation certificate CN {cn!r} is on the deny-list")
-        if leaf.subject == leaf.issuer:
-            # Self-issued single-cert chain. Legitimate for Chromium's virtual
-            # authenticator, never for vendor hardware — the RP decides whether
-            # it trusts that certificate by name.
-            if policy["trusted_attestation_cns"] and cn not in policy["trusted_attestation_cns"]:
-                raise RpError(
-                    f"attestation certificate {cn!r} is self-issued and is not a "
-                    "trusted FIDO attestation CA"
-                )
-        elif len(x5c) > 1:
-            root = x509.load_der_x509_certificate(x5c[-1])
-            if leaf.issuer != root.subject:
-                raise RpError("attestation chain does not terminate at the presented root")
-            issuer_cn = _common_name(root) or _common_name(leaf) or ""
-            trusted = policy["trusted_attestation_cns"] or KNOWN_FIDO_ATTESTATION_ISSUERS
-            if issuer_cn not in trusted:
-                raise RpError(
-                    f"attestation root {issuer_cn!r} is not a trusted FIDO attestation CA "
-                    "— this authenticator vouched for itself, so it cannot be "
-                    "treated as hardware-backed"
-                )
+
+        _verify_attestation_chain(x5c, policy)
+        _validate_attestation_subject(leaf)
+
+        try:
+            ext = leaf.extensions.get_extension_for_oid(
+                x509.oid.ObjectIdentifier("1.3.6.1.4.1.45724.1.1.4")
+            )
+        except x509.ExtensionNotFound:
+            ext = None
+        if ext is not None:
+            if ext.critical:
+                raise RpError("attestation certificate AAGUID extension must not be critical")
+            if getattr(ext.value, "value", b"") != b"\x04\x10" + aaguid:
+                raise RpError("attestation certificate AAGUID does not match authData")
         return
 
     # self-attestation: spec requires an all-zero AAGUID
@@ -290,6 +313,138 @@ def _verify_attestation_statement(fmt: str, stmt: dict, signed_data: bytes,
             "self-attestation presented with a non-zero AAGUID — spec violation, "
             "and a cheap signal an RP can check"
         )
+
+
+def _validate_attestation_subject(leaf):
+    required = {
+        x509.oid.NameOID.COUNTRY_NAME: "C",
+        x509.oid.NameOID.ORGANIZATION_NAME: "O",
+        x509.oid.NameOID.ORGANIZATIONAL_UNIT_NAME: "OU",
+        x509.oid.NameOID.COMMON_NAME: "CN",
+    }
+    values = {}
+    for oid, label in required.items():
+        attributes = leaf.subject.get_attributes_for_oid(oid)
+        if len(attributes) != 1 or not attributes[0].value:
+            raise RpError(f"attestation certificate subject requires exactly one {label}")
+        values[label] = attributes[0].value
+    if len(values["C"]) != 2:
+        raise RpError("attestation certificate subject C must be a two-letter country code")
+    if values["OU"] != "Authenticator Attestation":
+        raise RpError(
+            "attestation certificate subject OU must equal 'Authenticator Attestation'"
+        )
+
+
+def _verify_attestation_chain(x5c: list, policy: dict):
+    """Validate the presented chain to a SHA-256-pinned trust anchor."""
+    certificates = [x509.load_der_x509_certificate(value) for value in x5c]
+    leaf = certificates[0]
+    _validate_certificate_time(leaf, "attestation leaf")
+    _require_basic_constraints(leaf, "attestation leaf", expected_ca=False)
+
+    current = leaf
+    for index, issuer in enumerate(certificates[1:], start=1):
+        label = "attestation root" if index == len(certificates) - 1 else "attestation intermediate"
+        _validate_certificate_time(issuer, label)
+        _require_basic_constraints(issuer, label, expected_ca=True)
+        _check_path_length(issuer, certificates[1:index])
+        if current.issuer != issuer.subject:
+            raise RpError("attestation certificate chain issuer/subject mismatch")
+        _verify_certificate_signature(current, issuer.public_key())
+        current = issuer
+
+    trusted_fingerprints = {
+        value.lower().replace(":", "")
+        for value in policy.get("trusted_attestation_root_sha256", [])
+    }
+    current_fingerprint = current.fingerprint(hashes.SHA256()).hex()
+    if current_fingerprint in trusted_fingerprints:
+        if current.subject == current.issuer:
+            _verify_certificate_signature(current, current.public_key())
+        return current
+
+    for value in policy.get("trusted_attestation_root_certificates", []):
+        root = _load_certificate(value)
+        fingerprint = root.fingerprint(hashes.SHA256()).hex()
+        if fingerprint not in trusted_fingerprints:
+            continue
+        _validate_certificate_time(root, "attestation root")
+        _require_basic_constraints(root, "attestation root", expected_ca=True)
+        _check_path_length(root, certificates[1:])
+        if current.issuer != root.subject:
+            continue
+        _verify_certificate_signature(current, root.public_key())
+        if root.subject == root.issuer:
+            _verify_certificate_signature(root, root.public_key())
+        return root
+
+    raise RpError("attestation root fingerprint is not pinned by relying-party policy")
+
+
+def _load_certificate(value):
+    if isinstance(value, x509.Certificate):
+        return value
+    if isinstance(value, str):
+        value = value.encode()
+    try:
+        if value.startswith(b"-----BEGIN CERTIFICATE-----"):
+            return x509.load_pem_x509_certificate(value)
+        return x509.load_der_x509_certificate(value)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RpError("invalid trusted attestation root certificate") from exc
+
+
+def _require_basic_constraints(cert, label: str, expected_ca: bool):
+    try:
+        constraints = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+    except x509.ExtensionNotFound as exc:
+        raise RpError(f"{label} lacks Basic Constraints") from exc
+    if constraints.ca is not expected_ca:
+        expected = "true" if expected_ca else "false"
+        raise RpError(f"{label} must have CA={expected}")
+
+
+def _check_path_length(issuer, subordinate_cas):
+    limit = issuer.extensions.get_extension_for_class(x509.BasicConstraints).value.path_length
+    count = sum(cert.subject != cert.issuer for cert in subordinate_cas)
+    if limit is not None and count > limit:
+        raise RpError("attestation certificate chain exceeds CA path length constraint")
+
+
+def _validate_certificate_time(cert, label: str):
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    if hasattr(cert, "not_valid_before_utc"):
+        not_before = cert.not_valid_before_utc
+        not_after = cert.not_valid_after_utc
+    else:
+        not_before = cert.not_valid_before.replace(tzinfo=timezone.utc)
+        not_after = cert.not_valid_after.replace(tzinfo=timezone.utc)
+    if now < not_before or now > not_after:
+        raise RpError(f"{label} is outside its validity period")
+
+
+def _verify_certificate_signature(cert, issuer_key):
+    try:
+        if isinstance(issuer_key, rsa.RSAPublicKey):
+            issuer_key.verify(
+                cert.signature,
+                cert.tbs_certificate_bytes,
+                padding.PKCS1v15(),
+                cert.signature_hash_algorithm,
+            )
+        elif isinstance(issuer_key, ec.EllipticCurvePublicKey):
+            issuer_key.verify(
+                cert.signature,
+                cert.tbs_certificate_bytes,
+                ec.ECDSA(cert.signature_hash_algorithm),
+            )
+        else:
+            raise RpError("unsupported attestation issuer key type")
+    except InvalidSignature as exc:
+        raise RpError("attestation certificate chain signature is invalid") from exc
 
 
 def _common_name(cert) -> Optional[str]:
