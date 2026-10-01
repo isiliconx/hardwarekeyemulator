@@ -192,3 +192,15 @@ def test_get_info_does_not_advertise_unimplemented_uv(tmp_path):
     auth = Ctap2Authenticator(str(tmp_path / "creds.json"), attestation_mode="none")
     assert "uv" not in auth.get_info()[4]
     assert 0x0E not in auth.get_info()
+
+
+def test_upstream_policy_demo_uses_repaired_core_api(tmp_path, monkeypatch):
+    import policy_lab
+    def isolated_auth(**kwargs):
+        kwargs["store_path"] = str(tmp_path / "creds.json")
+        return Ctap2Authenticator(**kwargs)
+    monkeypatch.setattr("ctap2_core.Ctap2Authenticator", isolated_auth)
+    auth_data, statement, data = policy_lab.build_demo_attestation()
+    assert auth_data[32] & FLAG_UV
+    assert statement["x5c"]
+    assert data

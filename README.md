@@ -16,7 +16,7 @@ this revision. Earlier browser results below are historical evidence only.
 | `selftest_hid.py` — CTAP2 core over real CTAPHID framing | **36 passed, 0 failed** |
 | `selftest_e2e.py` — register → authenticate → RP verification | **21 passed, 0 failed** |
 | `selftest_uhid.py` — Linux UHID ABI packing, descriptor, CTAP2 core smoke test | **35 passed, 0 failed** |
-| `pytest tests -q` — interoperability and security regressions | **43 passed, 0 failed** |
+| `pytest tests -q` — interoperability and security regressions | **44 passed, 0 failed** |
 | `drive_browser.py` — historical Chrome virtual-authenticator ceremony | **not rerun for this revision** |
 
 Historical browser run (before this repair):
