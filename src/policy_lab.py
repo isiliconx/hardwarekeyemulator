@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 
 import cbor2
 from cryptography import x509
@@ -140,9 +141,9 @@ def build_demo_attestation():
     """Produce a real packed attestation from the local lab CA: a genuine
     signature from a real key, just not a vendor key."""
     from ctap2_core import Ctap2Authenticator
-    if os.path.exists("/tmp/policy_lab_creds.json"):
-        os.remove("/tmp/policy_lab_creds.json")
-    auth = Ctap2Authenticator(store_path="/tmp/policy_lab_creds.json")
+    temporary = tempfile.TemporaryDirectory(prefix="policy-lab-")
+    auth = Ctap2Authenticator(store_path=os.path.join(temporary.name, "creds.json"),
+                             uv_gate=lambda: True)
     challenge = os.urandom(32)
     client_data = json.dumps({
         "type": "webauthn.create",
@@ -154,12 +155,12 @@ def build_demo_attestation():
     resp = auth.make_credential({
         "clientDataHash": cdh,
         "rp": {"id": "lab.example", "name": "Lab RP"},
-        "user": {"id": b"user-1".hex(), "name": "binda", "displayName": "Binda"},
+        "user": {"id": b"user-1", "name": "binda", "displayName": "Binda"},
         "pubKeyCredParams": [{"type": "public-key", "alg": -7}],
         "options": {"rk": True, "uv": True},
         "credProtect": "userVerificationOptional",
     })
-    return resp["authData"], resp["attStmt"], client_data
+    return resp[2], resp[3], client_data
 
 
 def build_forged_attestation():

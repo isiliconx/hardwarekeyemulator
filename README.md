@@ -1,10 +1,11 @@
 # FIDO2 / CTAP2 Hardware-Key Emulator — Lab Build
 
-A software authenticator that speaks the **real FIDO2 / CTAP2 protocols**, registers
-and authenticates against a live site through Chrome's actual WebAuthn stack, and
-tells you exactly what a relying party can and cannot learn about it.
+A lab software authenticator with CTAP2 core operations, CTAPHID framing,
+Linux UHID transport code, and a local WebAuthn relying party.
 
-Built and verified on: Chrome 148.0.7778.96, Python 3.12, Linux 6.12.
+The September 30, 2026 repair was verified with automated tests on Windows.
+Live Linux UHID, USB gadget, and browser/OS ceremonies have not been rerun for
+this revision. Earlier browser results below are historical evidence only.
 
 ---
 
@@ -14,10 +15,11 @@ Built and verified on: Chrome 148.0.7778.96, Python 3.12, Linux 6.12.
 |---|---|
 | `selftest_hid.py` — CTAP2 core over real CTAPHID framing | **36 passed, 0 failed** |
 | `selftest_e2e.py` — register → authenticate → RP verification | **21 passed, 0 failed** |
-| `selftest_uhid.py` — uhid ABI, descriptor, CTAP2-over-HID | **26 passed, 0 failed** |
-| `drive_browser.py` — live Chrome ceremony against the lab RP | **verified, signCount 1 → 2** |
+| `selftest_uhid.py` — Linux UHID ABI packing, descriptor, CTAP2 core smoke test | **35 passed, 0 failed** |
+| `pytest tests -q` — interoperability and security regressions | **44 passed, 0 failed** |
+| `drive_browser.py` — historical Chrome virtual-authenticator ceremony | **not rerun for this revision** |
 
-Live browser run:
+Historical browser run (before this repair):
 
 ```
 [driver] virtual authenticator 48c60fe7-… (transport=usb, rk, uv)
@@ -53,9 +55,10 @@ Those first three are **one comparison each**. A site that pins FIDO MDS attesta
 roots, or checks the AAGUID against the metadata blob, rejects this device at
 registration — before any assertion is ever signed.
 
-What the emulator *does* get right: everything an RP sees at the WebAuthn layer.
-Key generation, COSE encoding, signature counters, resident/discoverable credentials,
-UP/UV flags, clientDataHash binding, origin scoping, and the full CTAPHID wire format.
+Automated tests cover key generation, COSE encoding, signature counters,
+credential scoping, UP/UV behavior, clientDataHash binding, exact origin checks,
+attestation policy, and CTAPHID framing. This is a lab emulator, not a certified
+hardware authenticator or a production relying-party service.
 
 ---
 
@@ -86,15 +89,12 @@ root, and no browser cooperation. `uhid_ctap.py` declares the FIDO usage page
 (`0xF1D0` / usage `0x01`), 64-byte reports, and the FIDO Alliance demo VID/PID
 (`0xF1D0:0x0001`) — which is what makes the browser treat it as an authenticator.
 
-**Verification status — read this before you rely on it.** The uhid ABI layer
-(struct framing, `uhid_create` layout, report descriptor, CTAP2-over-HID round trip)
-is covered by `selftest_uhid.py` — 26 tests, all passing. The **ioctl against a live
-uhid driver could not be executed here**: this build ran in a container whose host
-kernel has no uhid driver and no module loader, so `uhid_ctap.py` here exits with an
-explicit diagnostic rather than a fake success. Run it on a normal host with
-`CONFIG_INPUT_UHID=y` to confirm the kernel handoff. Everything above the HID layer —
-CTAP2 core, CTAPHID framing, registration, authentication, RP verification — is
-verified end to end.
+**Verification status — read this before you rely on it.** The UHID ABI layer
+(`UHID_CREATE2`, `UHID_INPUT2`, `UHID_OUTPUT`, descriptor packing, and event parsing)
+is covered by `selftest_uhid.py` and the pytest regression suite. A live
+`/dev/uhid` device was not available on the verification host, so the final kernel
+handoff still needs confirmation on Linux with `CONFIG_INPUT_UHID=y`. The CTAP2 core, CTAPHID loopback, and RP registration/authentication paths pass
+automated tests; this does not prove browser or kernel interoperability.
 
 ---
 
@@ -112,7 +112,8 @@ verified end to end.
 | `analyze_attestation.py` | What an RP can learn from an attestation statement |
 | `hid_gadget.sh` | USB HID gadget descriptor on the FIDO usage page |
 | `uhid_ctap.py` | **Any-browser path** — binds the key to the OS via `/dev/uhid` |
-| `selftest_hid.py`, `selftest_e2e.py`, `selftest_uhid.py` | Test suites (83 total) |
+| `selftest_hid.py`, `selftest_e2e.py`, `selftest_uhid.py` | Scripted self-tests (92 checks total) |
+| `tests/` | Pytest interoperability and security regressions |
 
 ---
 
@@ -170,7 +171,7 @@ until the 30s timeout. Everything must happen on one session.
 ## Third, if you port this
 
 **Packed attestation signs with the attestation certificate's key, not the
-credential's** (WebAuthn §8.2) — only an empty `x5c` means self-attestation.
+credential's** (WebAuthn §8.2) — an absent `x5c` indicates self-attestation.
 Verifying against the credential key rejects valid responses, including
 Chromium's.
 
@@ -183,3 +184,29 @@ Chromium's.
 makes it pass headlessly. CTAP2 numeric keys differ per command — `makeCredential` and
 `getAssertion` both start at key 1 with different meanings, and conflating them is the
 classic CTAP implementation bug (both are spelled out in `ctap2_core.py`).
+
+
+## Repair defaults and limits
+
+- CTAPHID TCP listeners default to loopback; a remote bind requires `--allow-remote`.
+- User presence prompts are required by default. `--no-touch-required` is an unsafe
+  lab override. `--internal-uv` explicitly enables a software prompt, not biometric
+  or hardware verification; without it, requests requiring UV fail closed.
+- GetInfo advertises only `FIDO_2_0`; unsupported U2F messaging and UV are not
+  advertised. CTAP status bytes and the 7,609-byte CTAPHID framing limit are
+  regression-tested; incomplete messages expire after three seconds.
+- Presence input is synchronous: waiting at the prompt blocks receipt of active
+  CANCEL/INIT commands until the prompt completes. Idle CANCEL is ignored.
+  Complete HID/browser conformance is not claimed; responsive in-flight cancellation
+  requires a cancellable presence mechanism.
+- PIN/UV protocols and credential management are unsupported. Multiple discoverable
+  credentials for one RP require an allowList; ambiguous discovery is rejected until
+  account selection or enumeration is implemented.
+- Required attestation must chain to an explicitly SHA-256-pinned trust anchor.
+  Certificate common names do not grant trust; self-attestation cannot satisfy this policy.
+- The lab RP uses process-local locks and expiring, one-time server-side challenges.
+  Run one server process; multiple workers require shared challenge and database storage.
+
+To rerun the repair regression suite, install `pytest` and `fido2` in addition to
+the runtime dependencies above, then run `python -m pytest tests -q` and each of
+the three `src/selftest_*.py` scripts.

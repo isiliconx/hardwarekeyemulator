@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import threading
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -21,10 +22,8 @@ from rp_verify import (
     POLICY, RpError, verify_assertion, verify_registration,
 )
 
-os.makedirs("/tmp/fido2lab-e2e", exist_ok=True)
-STORE = "/tmp/fido2lab-e2e/creds.json"
-if os.path.exists(STORE):
-    os.remove(STORE)
+_temp = tempfile.TemporaryDirectory(prefix="fido2lab-e2e-")
+STORE = os.path.join(_temp.name, "creds.json")
 
 RP_ID = "lab.example"
 ORIGIN = f"https://{RP_ID}"
@@ -51,8 +50,16 @@ def client_data(ceremony: str, challenge: bytes, origin: str = ORIGIN) -> bytes:
     }).encode()
 
 
+def webauthn_attestation(response: dict) -> dict:
+    return {"fmt": response[1], "authData": response[2], "attStmt": response[3]}
+
+
 def bring_up(attestation_mode="packed_x5c"):
-    auth = Ctap2Authenticator(store_path=STORE, attestation_mode=attestation_mode)
+    auth = Ctap2Authenticator(
+        store_path=STORE,
+        attestation_mode=attestation_mode,
+        uv_gate=lambda: True,
+    )
     host_t = LoopbackTransport().open()
     dev_t = host_t.peer().open()
     side = CtapHidDeviceSide(dev_t, auth, verbose=False)
@@ -71,13 +78,16 @@ cd_hash = _hashlib.sha256(cd).digest()
 status, resp = host.make_credential({
     1: cd_hash,
     2: {"id": RP_ID, "name": "Lab IdP"},
-    3: {"id": os.urandom(16).hex(), "name": "binda", "displayName": "Binda"},
+    3: {"id": os.urandom(16), "name": "binda", "displayName": "Binda"},
     4: [{"type": "public-key", "alg": -7}],
     7: {"rk": True, "up": True, "uv": True},
 })
 check("makeCredential returned OK", status == 0x00, hex(status))
+resp = webauthn_attestation(resp)
 
-reg = verify_registration(RP_ID, cd, resp, challenge)
+reg = verify_registration(
+    RP_ID, cd, resp, challenge, expected_origin=ORIGIN
+)
 check("RP verified the registration", bool(reg["credential_id"]))
 check("credential id is 32 bytes", len(reg["credential_id"]) == 32, len(reg["credential_id"]))
 check("UP/UV flags seen by RP", reg["flags"] & FLAG_UP and reg["flags"] & FLAG_UV)
@@ -106,7 +116,9 @@ print(f"  verdict: {analysis['verdict']}")
 print("\n== RP refuses attestation-less registration (policy on) ==")
 strict = {**POLICY, "require_attestation": True}
 try:
-    verify_registration(RP_ID, cd, resp, challenge, policy=strict)
+    verify_registration(
+        RP_ID, cd, resp, challenge, expected_origin=ORIGIN, policy=strict
+    )
     check("RP rejects untrusted attestation chain", False, "accepted!")
 except RpError as exc:
     check("RP policy gate is live", True)
@@ -123,15 +135,21 @@ status2, resp2 = host.get_assertion({
     5: {"up": True, "uv": True},
 })
 check("getAssertion returned OK", status2 == 0x00, hex(status2))
-res = verify_assertion(RP_ID, cd2, resp2, reg["public_key_der"], reg["sign_count"], challenge2)
+res = verify_assertion(
+    RP_ID, cd2, resp2, reg["public_key_der"], reg["sign_count"], challenge2,
+    expected_origin=ORIGIN,
+)
 check("RP verified the assertion signature", bool(res["credential_id"]))
 check("user handle returned", res["user_handle"] is not None)
-check("numberOfCredentials = 1", res["number_of_credentials"] == 1, res["number_of_credentials"])
+check("single assertion omits enumeration count", res["number_of_credentials"] is None)
 print(f"      sign count advanced {reg['sign_count']} -> {res['sign_count']}")
 
 print("\n== cloned-counter detection (RP refuses a stalled counter) ==")
 try:
-    verify_assertion(RP_ID, cd2, resp2, reg["public_key_der"], res["sign_count"], challenge2)
+    verify_assertion(
+        RP_ID, cd2, resp2, reg["public_key_der"], res["sign_count"], challenge2,
+        expected_origin=ORIGIN,
+    )
     check("RP detects stalled signature counter", False, "accepted a replayed count")
 except RpError as exc:
     check("RP detects stalled signature counter", True)
@@ -140,7 +158,9 @@ except RpError as exc:
 print("\n== wrong ceremony type is rejected ==")
 try:
     bad = client_data("webauthn.get", challenge)
-    verify_registration(RP_ID, bad, resp, challenge)
+    verify_registration(
+        RP_ID, bad, resp, challenge, expected_origin=ORIGIN
+    )
     check("RP rejects wrong ceremony type", False, "accepted")
 except RpError as exc:
     check("RP rejects wrong ceremony type", True)
@@ -149,7 +169,9 @@ except RpError as exc:
 print("\n== cross-origin replay is rejected ==")
 try:
     foreign = client_data("webauthn.create", challenge, origin="https://evil.example")
-    verify_registration(RP_ID, foreign, resp, challenge)
+    verify_registration(
+        RP_ID, foreign, resp, challenge, expected_origin=ORIGIN
+    )
     check("RP rejects foreign origin", False, "accepted")
 except (RpError, KeyError) as exc:
     check("RP rejects foreign origin", True)
@@ -157,13 +179,13 @@ except (RpError, KeyError) as exc:
 
 print("\n== attestation modes compared ==")
 for mode in ("none", "packed_self", "packed_x5c"):
-    a = Ctap2Authenticator(store_path=f"/tmp/fido2lab-e2e/{mode}.json",
+    a = Ctap2Authenticator(store_path=os.path.join(_temp.name, f"{mode}.json"),
                            attestation_mode=mode)
-    r = a.make_credential({
+    r = webauthn_attestation(a.make_credential({
         1: os.urandom(32), 2: {"id": RP_ID, "name": "Lab"},
-        3: {"id": os.urandom(16).hex(), "name": "u"},
+        3: {"id": os.urandom(16), "name": "u"},
         4: [{"type": "public-key", "alg": -7}], 7: {"rk": True},
-    })
+    }))
     rep = inspect(r, r["authData"], os.urandom(32))
     sigs = len([f for f in rep.get("findings", []) if f["rp_can_reject"]])
     print(f"  {mode:14} fmt={r['fmt']:6} rejectable_signals={sigs}")

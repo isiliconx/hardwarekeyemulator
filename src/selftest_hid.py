@@ -6,6 +6,7 @@ import os
 import struct
 import sys
 import threading
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -19,10 +20,8 @@ from ctaphid import (
     CtapHidDevice, CtapHidDeviceSide, LoopbackTransport, CMD_INIT, CMD_CBOR,
 )
 
-STORE = "/tmp/fido2lab-selftest/creds.json"
-os.makedirs("/tmp/fido2lab-selftest", exist_ok=True)
-if os.path.exists(STORE):
-    os.remove(STORE)
+_temp = tempfile.TemporaryDirectory(prefix="fido2lab-selftest-")
+STORE = os.path.join(_temp.name, "creds.json")
 
 RP_ID = "lab.example"
 ok = fail = 0
@@ -39,14 +38,16 @@ def check(name, cond, extra=""):
 
 
 print("== boot authenticator + device side ==")
-auth = Ctap2Authenticator(store_path=STORE, attestation_mode="packed_x5c")
+auth = Ctap2Authenticator(
+    store_path=STORE, attestation_mode="packed_x5c", uv_gate=lambda: True
+)
 dev_a = LoopbackTransport().open()          # host side carrier
 dev_b = dev_a.peer().open()                # device side carrier
 side = CtapHidDeviceSide(dev_b, auth, verbose=True)
 threading.Thread(target=side.serve_forever, daemon=True).start()
 
 print("== CTAPHID INIT handshake ==")
-host = CtapHidDevice(dev_a, auth)
+host = CtapHidDevice(dev_a, verbose=True)
 channel = host.init_sequence()
 check("channel allocated", isinstance(channel, int) and channel != 0xFFFFFFFF)
 check("channel nonzero", channel != 0)
@@ -57,10 +58,10 @@ check("ping echo", pong == b"hello", pong)
 
 print("== authenticatorGetInfo (0x04) ==")
 info = host.get_info()
-check("info has versions", 1 in info and -7 in info[1], list(info))
-check("info advertises ES256", -7 in info[1])
-check("rk supported", info[0x0C]["rk"] is True)
-print("   versions:", info[1], "maxMsgSize:", info.get(2))
+check("info has versions", 1 in info and "FIDO_2_0" in info[1], list(info))
+check("info advertises ES256", any(a.get("alg") == -7 for a in info[10]))
+check("rk supported", info[4]["rk"] is True)
+print("   versions:", info[1], "maxMsgSize:", info.get(5))
 
 print("== large payload fragmentation (multi-frame CONT) ==")
 big = os.urandom(400)
@@ -75,23 +76,23 @@ client_data_hash = os.urandom(32)
 params = {
     1: client_data_hash,
     2: {"id": RP_ID, "name": "Lab IdP"},
-    3: {"id": os.urandom(16).hex(), "name": "binda", "displayName": "Binda"},
+    3: {"id": os.urandom(16), "name": "binda", "displayName": "Binda"},
     4: [{"type": "public-key", "alg": -7}],
-    7: {"rk": True},
+    7: {"rk": True, "uv": True},
 }
 status, resp = host.make_credential(params)
 check("makeCredential status OK", status == 0x00, hex(status))
-check("response has fmt", "fmt" in resp, list(resp))
-check("fmt is packed", resp.get("fmt") == "packed", resp.get("fmt"))
-auth_data = resp["authData"]
+check("response has fmt", 1 in resp, list(resp))
+check("fmt is packed", resp.get(1) == "packed", resp.get(1))
+auth_data = resp[2]
 check("AT flag set", auth_data[32] & FLAG_AT != 0)
 check("UP flag set", auth_data[32] & FLAG_UP != 0)
 check("UV flag set", auth_data[32] & FLAG_UV != 0, hex(auth_data[32]))
 # Per spec the credential ID is not a CBOR response field — parse it from authData.
-cred_id = parse_attested_credential_id(resp["authData"])
+cred_id = parse_attested_credential_id(resp[2])
 check("credentialId parsed from authData", len(cred_id) == 32, len(cred_id))
-check("x5c has leaf + root", len(resp["attStmt"]["x5c"]) == 2,
-      len(resp["attStmt"].get("x5c", [])))
+check("x5c has leaf + root", len(resp[3]["x5c"]) == 2,
+      len(resp[3].get("x5c", [])))
 check("user present in store", len(auth.list_credentials(RP_ID)) == 1)
 
 print("== authenticatorGetAssertion (0x02) ==")
@@ -103,7 +104,7 @@ assert_params = {
 }
 status2, resp2 = host.get_assertion(assert_params)
 check("getAssertion status OK", status2 == 0x00, hex(status2))
-check("assertion returns credentialId", resp2[1] == cred_id)
+check("assertion returns credentialId", resp2[1]["id"] == cred_id)
 check("signature present", len(resp2[3]) > 0)
 check("no AT flag on assertion", resp2[2][32] & FLAG_AT == 0)
 check("signCount in authData", struct.unpack(">I", resp2[2][33:37])[0] >= 1,
@@ -112,13 +113,13 @@ check("signCount in authData", struct.unpack(">I", resp2[2][33:37])[0] >= 1,
 print("== resident credential lookup (no allowList) ==")
 status3, resp3 = host.get_assertion({1: RP_ID, 2: client_data_hash})
 check("discoverable assertion OK", status3 == 0x00, hex(status3))
-check("same credential", resp3[1] == cred_id)
+check("same credential", resp3[1]["id"] == cred_id)
 check("user entity returned", resp3.get(4) is not None)
 
 print("== wrong rpId is rejected ==")
 status4, _ = host.get_assertion({1: "evil.example", 2: client_data_hash,
                                   3: [{"type": "public-key", "id": cred_id.hex()}]})
-check("foreign rpId -> CTAP2_ERR_NO_CREDENTIALS", status4 == 0x2F, hex(status4))
+check("foreign rpId -> CTAP2_ERR_NO_CREDENTIALS", status4 == 0x2E, hex(status4))
 
 print("== excludeList blocks re-registration ==")
 status5, _ = host.make_credential({**params, 5: [{"type": "public-key", "id": cred_id.hex()}]})
@@ -155,18 +156,18 @@ check("attestation CA persisted", auth2._ca.root_cert_der == auth._ca.root_cert_
 
 print("== attestation modes ==")
 for mode in ("none", "packed_self", "packed_x5c"):
-    a = Ctap2Authenticator(store_path=f"/tmp/fido2lab-selftest/m-{mode}.json",
+    a = Ctap2Authenticator(store_path=os.path.join(_temp.name, f"m-{mode}.json"),
                            attestation_mode=mode)
     r = a.make_credential({
         1: os.urandom(32), 2: {"id": RP_ID, "name": "Lab"},
         3: {"id": os.urandom(16).hex(), "name": "u"}, 4: [{"alg": -7}],
     })
     if mode == "none":
-        check("fmt=none, empty stmt", r["fmt"] == "none" and r["attStmt"] == {})
+        check("fmt=none, empty stmt", r[1] == "none" and r[3] == {})
     elif mode == "packed_self":
-        check("fmt=packed self-attestation", r["fmt"] == "packed" and r["attStmt"]["x5c"] == [])
+        check("fmt=packed self-attestation", r[1] == "packed" and "x5c" not in r[3])
     else:
-        check("fmt=packed with x5c chain", r["fmt"] == "packed" and len(r["attStmt"]["x5c"]) == 2)
+        check("fmt=packed with x5c chain", r[1] == "packed" and len(r[3]["x5c"]) == 2)
 
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

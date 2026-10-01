@@ -3,7 +3,7 @@
 # *or on a TCP port for a lab box / VM, using the same state machine.*
 # *
 # *   PYTHONPATH=../libs python3 ctaphid_server.py --device /dev/hidg0
-# *   PYTHONPATH=../libs python3 ctaphid_server.py --listen 0.0.0.0:4444
+# *   PYTHONPATH=../libs python3 ctaphid_server.py --listen 127.0.0.1:4444
 # *
 # *This is the "browser sees a security key" half: speak CTAPHID to this port and
 # *you are talking to a real USB security key's wire protocol.*
@@ -36,7 +36,8 @@ class SocketServerTransport(HidTransport):
         self.max_clients = max_clients
 
     def open(self):
-        self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        family = socket.AF_INET6 if ":" in self.host else socket.AF_INET
+        self.srv = socket.socket(family, socket.SOCK_STREAM)
         self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.srv.bind((self.host, self.port))
         self.srv.listen(4)
@@ -99,34 +100,59 @@ def serve(transport, auth, verbose=True):
     print("[server] stopped", flush=True)
 
 
+def resolve_listen_address(value: str, allow_remote: bool = False) -> tuple[str, int]:
+    """Parse host:port, defaulting to loopback and rejecting remote binds."""
+    if ":" in value:
+        host, port_text = value.rsplit(":", 1)
+        host = host or "127.0.0.1"
+    else:
+        host, port_text = "127.0.0.1", value
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise ValueError("port must be between 1 and 65535")
+    if host not in ("127.0.0.1", "localhost", "::1") and not allow_remote:
+        raise ValueError("non-loopback listeners require --allow-remote")
+    return host, port
+
+
 def main():
     ap = argparse.ArgumentParser(description="CTAPHID authenticator server")
     ap.add_argument("--device", default="/dev/hidg0",
                     help="Linux HID gadget device (needs hid_gadget.sh)")
-    ap.add_argument("--listen", help="host:port to serve CTAPHID over TCP instead")
+    ap.add_argument("--listen", help="[host:]port for CTAPHID over TCP; defaults to loopback")
+    ap.add_argument("--allow-remote", action="store_true",
+                    help="allow an unauthenticated non-loopback TCP listener")
     ap.add_argument("--store", default="./creds.json",
                     help="credential store path (persisted across restarts)")
     ap.add_argument("--attestation", default="packed_x5c",
                     choices=["none", "packed_self", "packed_x5c"])
     ap.add_argument("--aaguid", default="00" * 16,
                     help="16-byte AAGUID (hex) — all-zero means self-attestation")
-    ap.add_argument("--touch-required", action="store_true",
-                    help="require an interactive presence gesture (Ctrl-C to refuse)")
+    ap.set_defaults(touch_required=True)
+    ap.add_argument("--no-touch-required", dest="touch_required", action="store_false",
+                    help="UNSAFE: approve user presence without an operator gesture")
+    ap.add_argument("--internal-uv", action="store_true",
+                    help="assert software user verification after the presence prompt")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
+    presence_gate = _presence_gate(args.touch_required)
     auth = Ctap2Authenticator(
         store_path=args.store,
         attestation_mode=args.attestation,
         aaguid=bytes.fromhex(args.aaguid),
-        up_gate=_presence_gate(args.touch_required),
+        up_gate=presence_gate,
+        uv_gate=presence_gate if args.internal_uv else None,
     )
     print(f"[server] store={args.store} attestation={args.attestation} "
           f"aaguid={args.aaguid}", flush=True)
 
     if args.listen:
-        host, _, port = args.listen.rpartition(":")
-        transport = SocketServerTransport(host or "0.0.0.0", int(port)).open()
+        try:
+            host, port = resolve_listen_address(args.listen, args.allow_remote)
+        except ValueError as exc:
+            ap.error(str(exc))
+        transport = SocketServerTransport(host, port).open()
     else:
         transport = LinuxHidGadgetTransport(args.device)
         try:
@@ -152,7 +178,7 @@ def _presence_gate(interactive: bool):
         try:
             ans = input("[presence] touch required — press Enter, or 'n' to refuse: ")
         except EOFError:
-            return True
+            return False
         return not ans.strip().lower().startswith("n")
 
     return gate

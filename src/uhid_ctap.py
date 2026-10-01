@@ -31,60 +31,81 @@ from ctap2_core import Ctap2Authenticator
 from ctaphid import CtapHidDeviceSide, REPORT_SIZE, HidTransport
 
 # Linux uhid ABI — include/uapi/linux/uhid.h
-UHID_CREATE = _UHID_CREATE = 0x11
-UHID_DESTROY = 0x02
-UHID_START = 0x01
-UHID_STOP = 0x0A
-UHID_OPEN = 0x03
-UHID_CLOSE = 0x04
-UHID_INPUT = 0x20          # host -> device (an OUT report)
-UHID_OUTPUT = 0x21         # device -> host (an IN report)
-UHID_SETUP = 0x06
-UHID_FEATURE = 0x07
+UHID_DESTROY = 1
+UHID_START = 2
+UHID_STOP = 3
+UHID_OPEN = 4
+UHID_CLOSE = 5
+UHID_OUTPUT = 6          # kernel -> userspace: host sent an OUT report
+UHID_GET_REPORT = 9
+UHID_GET_REPORT_REPLY = 10
+UHID_CREATE2 = 11
+UHID_INPUT2 = 12         # userspace -> kernel: device sent an IN report
+UHID_SET_REPORT = 13
+UHID_SET_REPORT_REPLY = 14
 
-UHID_EVENT_CREATE = 0x01
-UHID_EVENT_START = 0x02
-UHID_EVENT_STOP = 0x03
-UHID_EVENT_OPEN = 0x04
-UHID_EVENT_CLOSE = 0x05
-UHID_EVENT_INPUT = 0x06
-UHID_EVENT_OUTPUT = 0x07
-
+UHID_DATA_MAX = 4096
+HID_MAX_DESCRIPTOR_SIZE = 4096
 BUS_USB = 0x03
-UHID_API_VERSION = 5
 
 
-def uhid_event(ev_type: int, data: bytes = b"") -> bytes:
-    """struct uhid_event { __u32 type; __u8 data[UHID_DATA_MAX=4096]; }"""
-    return struct.pack("=I", ev_type) + data.ljust(4096, b"\x00")
+def _fixed_field(value: str, size: int) -> bytes:
+    encoded = value.encode()
+    if len(encoded) >= size:
+        encoded = encoded[: size - 1]
+    return encoded.ljust(size, b"\x00")
 
-def uhid_data_create(user_type: int, name: str, phys: str, uniq: str,
-                     bus: int, vendor: int, product: int, version: int,
-                     country: int = 0) -> bytes:
-    """
-    struct uhid_create (include/uapi/linux/uhid.h), no event header:
 
-        __u16 api_version; __u8 bus;
-        __u32 vendor, product, version;
-        __u32 country, user_type;
-        __u8 name[128], phys[128], uniq[128];
+def uhid_create2_event(
+    *, name: str, phys: str, uniq: str, bus: int, vendor: int,
+    product: int, version: int, country: int, report_descriptor: bytes,
+) -> bytes:
+    """Pack struct uhid_event with a uhid_create2_req payload."""
+    if len(report_descriptor) > HID_MAX_DESCRIPTOR_SIZE:
+        raise ValueError("HID report descriptor is too large")
+    payload = (
+        _fixed_field(name, 128)
+        + _fixed_field(phys, 64)
+        + _fixed_field(uniq, 64)
+        + struct.pack(
+            "=HHIIII", len(report_descriptor), bus, vendor, product, version, country
+        )
+        + report_descriptor.ljust(HID_MAX_DESCRIPTOR_SIZE, b"\x00")
+    )
+    return struct.pack("=I", UHID_CREATE2) + payload
 
-    Note the byte order: api_version is __u16 (little-endian), bus is a single
-    __u8, then 32-bit little-endian words. Getting this layout wrong produces an
-    ioctl EINVAL with no other symptom, so it is spelled out rather than packed
-    loosely.
-    """
-    def field(v: str) -> bytes:
-        return v.encode()[:128].ljust(128, b"\x00")
 
+def uhid_input2_event(report: bytes) -> bytes:
+    """Pack a device-to-host input report as UHID_INPUT2."""
+    if len(report) > UHID_DATA_MAX:
+        raise ValueError("UHID input report is too large")
     return (
-        struct.pack("=H", UHID_API_VERSION)
-        + struct.pack("=B", bus)
-        + struct.pack("=III", vendor, product, version)
-        + struct.pack("=II", country, user_type)
-        + field(name) + field(phys) + field(uniq)
+        struct.pack("=IH", UHID_INPUT2, len(report))
+        + report.ljust(UHID_DATA_MAX, b"\x00")
     )
 
+
+def uhid_destroy_event() -> bytes:
+    return struct.pack("=I", UHID_DESTROY)
+
+
+def parse_uhid_event(event: bytes) -> tuple[int, bytes]:
+    if len(event) < 4:
+        raise OSError("short uhid event")
+    return struct.unpack_from("=I", event, 0)[0], event[4:]
+
+
+def parse_uhid_output(event: bytes) -> bytes:
+    """Extract one host-to-device report from a UHID_OUTPUT event."""
+    event_type, payload = parse_uhid_event(event)
+    if event_type != UHID_OUTPUT:
+        raise ValueError(f"expected UHID_OUTPUT, received {event_type}")
+    if len(payload) < UHID_DATA_MAX + 3:
+        raise OSError("short UHID_OUTPUT event")
+    size, _report_type = struct.unpack_from("=HB", payload, UHID_DATA_MAX)
+    if size > UHID_DATA_MAX:
+        raise OSError("invalid UHID_OUTPUT report size")
+    return payload[:size]
 
 # FIDO usage page (0xF1D0), FIDO usage (0x01). A browser matches a security key
 # on these two values — this descriptor is the reason the OS *and* the browser
@@ -143,127 +164,117 @@ class UhidTransport(HidTransport):
                 f"{self.device} not found — run `sudo modprobe uhid` first"
             )
         self.fd = os.open(self.device, os.O_RDWR | os.O_NONBLOCK)
-        self._create()
-        self._set_report_descriptor()
-        # The kernel replies UHID_EVENT_CREATE, then START, then OPEN. Requests
-        # are allowed between START and OPEN, which is when a real device is live.
-        self._await(UHID_EVENT_START)
-        self._await(UHID_EVENT_OPEN)
+        try:
+            self._send_event(uhid_create2_event(
+                name=self.name,
+                phys="lab-fido2/uhid",
+                uniq="lab-fido2-ctap2",
+                bus=BUS_USB,
+                vendor=FIDO_VENDOR_ID,
+                product=FIDO_PRODUCT_ID,
+                version=0x0001,
+                country=0,
+                report_descriptor=REPORT_DESCRIPTOR,
+            ))
+            self._await(UHID_START)
+        except Exception:
+            os.close(self.fd)
+            self.fd = None
+            raise
         self._opened.set()
         return self
 
     def close(self):
         if self.fd is None:
             return
-        for event_type in (UHID_EVENT_STOP, UHID_EVENT_CLOSE):
-            try:
-                self._send(event_type)
-            except OSError:
-                pass
+        try:
+            self._send_event(uhid_destroy_event())
+        except OSError:
+            pass
         try:
             os.close(self.fd)
         except OSError:
             pass
         self.fd = None
 
-    # ------------------------------------------------------------------ uhid ioctl
+    def _send_event(self, event: bytes) -> None:
+        view = memoryview(event)
+        while view:
+            written = os.write(self.fd, view)
+            if written <= 0:
+                raise OSError("short uhid write")
+            view = view[written:]
 
-    def _send(self, event_type: int, data: bytes = b"") -> int:
-        """write() a uhid_event; returns bytes written."""
-        buf = uhid_event(event_type, data)
-        return os.write(self.fd, buf)
-
-    def _recv(self) -> tuple:
-        """read() one uhid_event -> (event_type, payload)."""
-        buf = os.read(self.fd, 4096 + 4)
-        if len(buf) < 4:
+    def _recv_event(self) -> bytes:
+        event = os.read(self.fd, 4 + 4372)
+        if len(event) < 4:
             raise OSError("short uhid read")
-        ev_type = struct.unpack("=I", buf[:4])[0]
-        return ev_type, buf[4:]
+        return event
 
     def _await(self, wanted: int, timeout: float = 5.0) -> bytes:
         import time
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                ev_type, data = self._recv()
+                event = self._recv_event()
             except BlockingIOError:
                 time.sleep(0.005)
                 continue
-            if ev_type == wanted:
+            event_type, data = parse_uhid_event(event)
+            if event_type == wanted:
                 return data
-            if ev_type == UHID_EVENT_OUTPUT:
-                # A stray IN report from a previous run; ignore during setup.
-                continue
         raise TimeoutError(f"uhid never sent event 0x{wanted:02x}")
-
-    def _ioctl(self, request: int, payload: bytes = b"") -> int:
-        import fcntl
-        return fcntl.ioctl(self.fd, request, payload)
-
-    def _create(self):
-        payload = uhid_data_create(
-            user_type=4,                       # UHID_USER_TYPE_OTHER
-            name=self.name,
-            phys="lab-fido2/uhid",
-            uniq="lab-fido2-ctap2",
-            bus=BUS_USB,
-            vendor=FIDO_VENDOR_ID,
-            product=FIDO_PRODUCT_ID,
-            version=0x0001,
-        )
-        # UHID_CREATE is an ioctl on the fd, not a write() of an event.
-        self._ioctl(UHID_CREATE, payload)
-
-    def _set_report_descriptor(self):
-        # write() of a UHID_SETUP event: __u16 size, then the descriptor bytes.
-        self._send(UHID_SETUP, struct.pack("=H", len(REPORT_DESCRIPTOR)) + REPORT_DESCRIPTOR)
 
     # ------------------------------------------------------------------ data path
 
     def write(self, data: bytes):
-        """Device -> host: an IN report via a UHID_OUTPUT event."""
+        """Device -> host: submit an IN report with UHID_INPUT2."""
         if len(data) != REPORT_SIZE:
             raise ValueError(f"HID report must be {REPORT_SIZE} bytes, got {len(data)}")
-        self._send(UHID_OUTPUT, bytes([0x00]) + data)
+        with self._lock:
+            self._send_event(uhid_input2_event(data))
 
     def read_exact(self, n: int, timeout: float = 30.0) -> bytes:
-        """Host -> device: a UHID_INPUT event carries one OUT report."""
+        """Host -> device: receive an OUT report from UHID_OUTPUT."""
         import time
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                ev_type, data = self._recv()
+                event = self._recv_event()
             except BlockingIOError:
                 time.sleep(0.001)
                 continue
-            if ev_type == UHID_EVENT_INPUT:
-                # data[0] is the report number; the report body follows
-                report = data[1:n + 1]
-                if len(report) == n:
-                    return report
+            event_type, _ = parse_uhid_event(event)
+            if event_type != UHID_OUTPUT:
+                continue
+            report = parse_uhid_output(event)
+            if len(report) != n:
                 raise OSError(f"uhid report was {len(report)} bytes, expected {n}")
-        raise TimeoutError(f"no HID input report within {timeout}s")
+            return report
+        raise TimeoutError(f"no HID output report within {timeout}s")
 
 
 # --------------------------------------------------------------------------- entry point
 
 
-def check_uhid() -> Optional[str]:
-    """Return None if uhid is usable, else a human-readable reason."""
-    if not os.path.exists("/dev/uhid"):
-        return ("/dev/uhid missing — run `sudo modprobe uhid`. If your kernel "
+def check_uhid(device: str = "/dev/uhid") -> Optional[str]:
+    """Return None if the selected uhid device is usable, else a reason."""
+    if not os.path.exists(device):
+        return (f"{device} missing — run `sudo modprobe uhid`. If your kernel "
                 "lacks CONFIG_INPUT_UHID there is no way to bind a userspace "
                 "HID device; this needs a normal host, not a container.")
     try:
-        fd = os.open("/dev/uhid", os.O_RDWR | os.O_NONBLOCK)
+        fd = os.open(device, os.O_RDWR | os.O_NONBLOCK)
     except OSError as exc:
         if exc.errno == 19:      # ENODEV
             return ("/dev/uhid present but the uhid driver is not loaded in the "
                     "host kernel (`sudo modprobe uhid`).")
         if exc.errno == 13:
-            return "/dev/uhid is root-only — try `sudo chmod 0666 /dev/uhid`."
-        return f"cannot open /dev/uhid: {exc}"
+            return (
+                f"cannot open {device}: permission denied. Grant a dedicated group "
+                "0660 access with a udev rule; do not make /dev/uhid world-writable."
+            )
+        return f"cannot open {device}: {exc}"
     os.close(fd)
     return None
 
@@ -276,11 +287,14 @@ def main():
     ap.add_argument("--store", default="./creds.json")
     ap.add_argument("--attestation", default="packed_x5c",
                     choices=["none", "packed_self", "packed_x5c"])
-    ap.add_argument("--touch-required", action="store_true",
-                    help="require an interactive presence gesture (Enter = touch)")
+    ap.set_defaults(touch_required=True)
+    ap.add_argument("--no-touch-required", dest="touch_required", action="store_false",
+                    help="UNSAFE: approve user presence without an operator gesture")
+    ap.add_argument("--internal-uv", action="store_true",
+                    help="assert software user verification after the presence prompt")
     args = ap.parse_args()
 
-    reason = check_uhid()
+    reason = check_uhid(args.device)
     if reason:
         print(f"[uhid] NOT AVAILABLE: {reason}")
         print("\nThis container's kernel has no uhid driver, so the HID binding "
@@ -291,10 +305,12 @@ def main():
 
     from ctap2_core import Ctap2Authenticator
 
+    presence_gate = _presence_gate(args.touch_required)
     auth = Ctap2Authenticator(
         store_path=args.store,
         attestation_mode=args.attestation,
-        up_gate=_presence_gate(args.touch_required),
+        up_gate=presence_gate,
+        uv_gate=presence_gate if args.internal_uv else None,
     )
 
     transport = UhidTransport(args.device)
@@ -336,7 +352,7 @@ def _presence_gate(interactive: bool):
         try:
             ans = input("[presence] press Enter to 'touch', or 'n' to refuse: ")
         except EOFError:
-            return True
+            return False
         return not ans.strip().lower().startswith("n")
 
     return gate

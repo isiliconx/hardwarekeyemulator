@@ -28,11 +28,16 @@ CTAPHID_BROADCAST = 0xFFFFFFFF
 
 # CTAPHID report layout (CTAP2 rev 2.1 §11.2):
 #   INIT frame : cid[4] | cmd[1] | bcnt[2] | data[57]   -> 64 bytes
-#   CONT frame : cid[4] | 0x80|seq[1] | data[59]       -> 64 bytes
+#   CONT frame : cid[4] | seq[1] | data[59]       -> 64 bytes
 REPORT_SIZE = 64
 INIT_PACKET = REPORT_SIZE - 7      # 57 bytes of data in the first frame
 CONT_PACKET = REPORT_SIZE - 5      # 59 bytes in each continuation frame
-DEVICE_VERSION = (2, 0, 0x0001)    # CTAP 2.0, build 1
+CTAPHID_PROTOCOL_VERSION = 2
+DEVICE_VERSION = (1, 0, 0)
+CAPABILITY_CBOR = 0x04
+CAPABILITY_NMSG = 0x08
+MAX_PAYLOAD_SIZE = INIT_PACKET + 128 * CONT_PACKET
+REASSEMBLY_TIMEOUT = 3.0
 
 KEEPALIVE_PROCESSING = 0x01
 KEEPALIVE_USER_ACTION_PENDING = 0x02
@@ -78,32 +83,38 @@ class CtapHidError(Exception):
 
 
 def parse_report(rep: bytes):
-    """Unpack one 64-byte report.
+    """Unpack one 64-byte CTAPHID report.
 
-    Returns (channel, cmd, bcnt, data). For a CONT frame bcnt is -1 and `data`
-    carries the raw continuation bytes; the caller tracks accumulation itself.
+    Initialization frames set bit 7 and carry CMD + BCNT. Continuation frames
+    carry a sequence number in the range 0x00..0x7f.
     """
     if len(rep) != REPORT_SIZE:
         raise CtapHidError(f"short report: {len(rep)} != {REPORT_SIZE}")
     channel = struct.unpack(">I", rep[0:4])[0]
-    cmd = rep[4]
-    if cmd & 0x80:
-        return channel, cmd, -1, rep[5:]
-    bcnt = struct.unpack(">H", rep[5:7])[0]
-    return channel, cmd, bcnt, rep[7:7 + bcnt]
+    marker = rep[4]
+    if marker & 0x80:
+        command = marker & 0x7F
+        bcnt = struct.unpack(">H", rep[5:7])[0]
+        return channel, command, bcnt, rep[7:7 + min(bcnt, INIT_PACKET)]
+    return channel, marker, -1, rep[5:]
 
 
 def pack_reports(channel: int, cmd: int, payload: bytes) -> list:
-    """Split a message into one INIT frame plus zero or more CONT frames."""
+    """Split a message into one initialization frame plus continuation frames."""
+    if len(payload) > MAX_PAYLOAD_SIZE:
+        raise CtapHidError(f"CTAPHID payload exceeds {MAX_PAYLOAD_SIZE} bytes")
     cid = struct.pack(">I", channel & 0xFFFFFFFF)
     frames = [
-        cid + struct.pack(">B", cmd) + struct.pack(">H", len(payload))
+        cid + struct.pack(">B", 0x80 | (cmd & 0x7F))
+        + struct.pack(">H", len(payload))
         + payload[:INIT_PACKET].ljust(INIT_PACKET, b"\x00")
     ]
     rest, seq = payload[INIT_PACKET:], 0
     while rest:
+        if seq > 0x7F:
+            raise CtapHidError("CTAPHID message needs too many continuation frames")
         frames.append(
-            cid + struct.pack(">B", 0x80 | (seq & 0x7F))
+            cid + struct.pack(">B", seq)
             + rest[:CONT_PACKET].ljust(CONT_PACKET, b"\x00")
         )
         rest = rest[CONT_PACKET:]
@@ -314,7 +325,7 @@ class CtapHidDevice:
         while True:
             out_cmd, out = self._rx(max(0.05, deadline - time.time()))
             if out_cmd == CMD_ERROR:
-                code = struct.unpack(">H", out[:2])[0] if len(out) >= 2 else -1
+                code = out[0] if out else -1
                 raise CtapHidError(f"CTAPHID_ERROR code={code}")
             if out_cmd == CMD_KEEPALIVE:
                 status = out[0] if out else 0
@@ -327,31 +338,23 @@ class CtapHidDevice:
     # ------------------------------------------------------------------ handshake
 
     def init_sequence(self) -> int:
-        """
-        Broadcast INIT(8-byte nonce) to learn the device nonce, then INIT again
-        carrying nonce | 16-byte CID to claim a channel. A real key does this in
-        firmware; here the identity stays inspectable from userspace.
-        """
-        self._tx(CMD_INIT, os.urandom(8), channel=CTAPHID_BROADCAST)
+        """Allocate a CTAPHID channel using the standard broadcast INIT exchange."""
+        nonce = os.urandom(8)
+        self._tx(CMD_INIT, nonce, channel=CTAPHID_BROADCAST)
         cmd, data = self._rx(10, expect_channel=CTAPHID_BROADCAST)
-        if cmd != CMD_INIT or len(data) < 12:
+        if cmd != CMD_INIT or len(data) != 17:
             raise CtapHidError(f"bad INIT reply: cmd=0x{cmd:02x} len={len(data)}")
-        nonce = data[:8]
-        major, minor, build = data[8], data[9], struct.unpack(">H", data[10:12])[0]
-        self._log(f"device init: nonce={nonce.hex()} ctap={major}.{minor} build={build}")
-
-        cid = os.urandom(16)
-        self._tx(CMD_INIT, nonce + cid, channel=CTAPHID_BROADCAST)
-        cmd2, data2 = self._rx(10, expect_channel=CTAPHID_BROADCAST, pin_channel=True)
-        channel = self.channel          # pinned to whatever the device claimed
-        if cmd2 != CMD_INIT:
-            raise CtapHidError("expected CMD_INIT on channel claim")
-        if data2[:8] != nonce:
+        if data[:8] != nonce:
             raise CtapHidError("INIT nonce mismatch — device not spec-compliant")
-        if channel == CTAPHID_BROADCAST:
-            raise CtapHidError("device echoed broadcast instead of claiming a channel")
-        self.channel_id = cid
-        self._log(f"channel allocated: 0x{channel:08x}")
+        channel = struct.unpack(">I", data[8:12])[0]
+        if channel in (0, CTAPHID_BROADCAST):
+            raise CtapHidError("device returned an invalid channel")
+        protocol, major, minor, build, capabilities = data[12:17]
+        self.channel = channel
+        self._log(
+            f"channel allocated: 0x{channel:08x}; protocol={protocol} "
+            f"device={major}.{minor}.{build} capabilities=0x{capabilities:02x}"
+        )
         return channel
 
     # ------------------------------------------------------------------ commands
@@ -381,10 +384,10 @@ class CtapHidDevice:
         return self.ctap2(0x02, cbor2.dumps(params, canonical=True), timeout)
 
     def get_key_agreement(self):
-        return self.ctap2(0x07, b"")
+        return self.client_pin(2, {1: 1})
 
     def client_pin(self, subcommand: int, params: dict = None):
-        payload = {1: subcommand}
+        payload = {2: subcommand}
         if params:
             payload.update(params)
         return self.ctap2(0x06, cbor2.dumps(payload, canonical=True), timeout=30.0)
@@ -412,9 +415,10 @@ class CtapHidDeviceSide:
     def serve_forever(self):
         self._log("serving CTAPHID")
         while not self.stop.is_set():
+            self._expire_channels()
             try:
                 rep = self.t.read_exact(REPORT_SIZE, timeout=1.0)
-            except Exception:
+            except (TimeoutError, CtapHidError):
                 continue
             try:
                 self._handle(rep)
@@ -424,46 +428,83 @@ class CtapHidDeviceSide:
 
     # ------------------------------------------------------------------ receive
 
+    def _expire_channels(self):
+        now = time.monotonic()
+        for channel, st in self.channels.items():
+            if st["cmd"] is not None and now >= st["expires"]:
+                st.update({"cmd": None, "bcnt": -1, "buf": bytearray(), "seq": 0})
+                self._reply(channel, CMD_ERROR, bytes([0x05]))
+
     def _handle(self, rep: bytes):
-        channel, cmd, bcnt, data = parse_report(rep)
-        if channel == CTAPHID_BROADCAST and cmd == CMD_INIT:
-            self._init(data)
+        self._expire_channels()
+        channel, marker, bcnt, data = parse_report(rep)
+        if bcnt >= 0 and marker == CMD_CANCEL:
             return
-        st = self.channels.setdefault(
-            channel, {"cmd": None, "bcnt": -1, "buf": bytearray()}
-        )
-        st["buf"] += data
+        if channel == CTAPHID_BROADCAST:
+            if bcnt >= 0 and marker == CMD_INIT and bcnt == 8:
+                self._init(data)
+            else:
+                self._reply(channel, CMD_ERROR, bytes([0x0B]))
+            return
+        if channel not in self.channels:
+            self._reply(channel, CMD_ERROR, bytes([0x0B]))
+            return
+
+        st = self.channels[channel]
+        if bcnt > MAX_PAYLOAD_SIZE:
+            st.update({"cmd": None, "bcnt": -1, "buf": bytearray(), "seq": 0})
+            self._reply(channel, CMD_ERROR, bytes([0x03]))
+            return
+        if bcnt >= 0 and marker == CMD_INIT:
+            if bcnt != 8:
+                self._reply(channel, CMD_ERROR, bytes([0x03]))
+                return
+            st.update({"cmd": None, "bcnt": -1, "buf": bytearray(), "seq": 0})
+            self._init(data, channel)
+            return
         if bcnt >= 0:
-            st["cmd"], st["bcnt"] = cmd, bcnt
+            if st["cmd"] is not None:
+                self._reply(channel, CMD_ERROR, bytes([0x06]))
+                return
+            st.update({"cmd": marker, "bcnt": bcnt, "buf": bytearray(data), "seq": 0,
+                       "expires": time.monotonic() + REASSEMBLY_TIMEOUT})
+        else:
+            if st["cmd"] is None or marker != st["seq"]:
+                st.update({"cmd": None, "bcnt": -1, "buf": bytearray(), "seq": 0})
+                self._reply(channel, CMD_ERROR, bytes([0x04]))
+                return
+            st["buf"] += data
+            st["seq"] += 1
+
         if st["bcnt"] >= 0 and len(st["buf"]) >= st["bcnt"]:
             payload = bytes(st["buf"][:st["bcnt"]])
-            # Capture the command from the INIT frame *before* clearing state —
-            # a CONT frame's cmd byte is 0x80|seq, not the real command.
-            real_cmd = st["cmd"] if st["cmd"] is not None else cmd
-            st.update({"cmd": None, "bcnt": -1, "buf": bytearray()})
+            real_cmd = st["cmd"]
+            st.update({"cmd": None, "bcnt": -1, "buf": bytearray(), "seq": 0})
             self._dispatch(channel, real_cmd, payload, st)
 
-    def _init(self, data: bytes):
-        """
-        Spec §11.2.9: an 8-byte payload is a nonce probe; nonce|16-byte CID claims
-        a channel on the first four CID bytes.
-        """
+    def _allocate_channel(self) -> int:
+        while self.next_channel in (0, CTAPHID_BROADCAST) or self.next_channel in self.channels:
+            self.next_channel = (self.next_channel + 1) & 0xFFFFFFFF
+        channel = self.next_channel
+        self.next_channel = (self.next_channel + 1) & 0xFFFFFFFF
+        return channel
+
+    def _init(self, data: bytes, request_channel: int = CTAPHID_BROADCAST):
+        """Allocate a broadcast channel or resynchronize an existing channel."""
         self.stats["init"] += 1
-        nonce, cid = data[:8], data[8:24]
-        version = struct.pack(">BBH", *DEVICE_VERSION)
-        if len(cid) == 16:
-            channel = struct.unpack(">I", cid[:4])[0]
-            if channel == CTAPHID_BROADCAST:
-                channel = self.next_channel
-                self.next_channel += 1
-            for frame in pack_reports(channel, CMD_INIT, nonce + version):
-                self.t.write(frame)
-            self.channels[channel] = {"cmd": None, "bcnt": -1, "buf": bytearray()}
-            self._log(f"channel claimed: 0x{channel:08x}")
-        else:
-            for frame in pack_reports(CTAPHID_BROADCAST, CMD_INIT, os.urandom(8) + version):
-                self.t.write(frame)
-            self._log("nonce probe")
+        nonce = data[:8]
+        channel = (self._allocate_channel() if request_channel == CTAPHID_BROADCAST
+                   else request_channel)
+        self.channels[channel] = {
+            "cmd": None, "bcnt": -1, "buf": bytearray(), "seq": 0,
+        }
+        payload = (
+            nonce
+            + struct.pack(">I", channel)
+            + bytes([CTAPHID_PROTOCOL_VERSION, *DEVICE_VERSION, CAPABILITY_CBOR | CAPABILITY_NMSG])
+        )
+        self._reply(request_channel, CMD_INIT, payload)
+        self._log(f"channel allocated: 0x{channel:08x}")
 
     # ------------------------------------------------------------------ dispatch
 
@@ -474,25 +515,28 @@ class CtapHidDeviceSide:
         elif cmd == CMD_WINK:
             self._reply(channel, CMD_WINK, b"")
         elif cmd == CMD_CANCEL:
-            self._reply(channel, CMD_CANCEL, b"")
+            return
         elif cmd == CMD_LOCK:
             self.locked = len(payload) == 1 and payload[0] == 0
             self._reply(channel, CMD_LOCK, b"")
         elif cmd == CMD_CBOR:
             self._ctap2(channel, payload)
         else:
-            self._reply(channel, CMD_ERROR, struct.pack(">H", 0x01))
+            self._reply(channel, CMD_ERROR, bytes([0x01]))
 
     def _ctap2(self, channel: int, payload: bytes):
         self.stats["cbor"] += 1
         if not payload:
-            self._reply(channel, CMD_ERROR, struct.pack(">H", 0x01))
+            self._reply(channel, CMD_CBOR, bytes([0x01]))
             return
         command, raw_params = payload[0], payload[1:]
+        if command in (0x04, 0x07, 0x08) and raw_params:
+            self._reply(channel, CMD_CBOR, bytes([0x03]))
+            return
         try:
             req = cbor2.loads(raw_params) if raw_params else {}
         except Exception:
-            self._reply(channel, CMD_ERROR, struct.pack(">H", 0x12))
+            self._reply(channel, CMD_CBOR, bytes([0x12]))
             return
 
         # CTAP2.1 says: emit KEEPALIVE(user_action_pending) while waiting for touch.
@@ -519,16 +563,14 @@ class CtapHidDeviceSide:
         if command == 0x02:
             return a.get_assertion(_ctap_params(req, GET_ASSERTION_KEYS))
         if command == 0x06:
-            return a.client_pin(req)
+            raise CtapError(0x01, "ClientPIN is not implemented")
         if command == 0x07:
-            return a.get_key_agreement()
-        if command == 0x08:
-            rp_id = _s(req.get(2))
-            perms_rp = _s(req.get(3), rp_id)
-            return a.get_pin_uv_token_using_uv(req[1], rp_id, perms_rp)
-        if command == 0x0A:
             return a.reset()
-        raise CtapError(0x2C, f"unsupported command 0x{command:02x}")
+        if command == 0x08:
+            raise CtapError(0x30, "no assertion enumeration is pending")
+        if command == 0x0A:
+            raise CtapError(0x01, "CredentialManagement is not implemented")
+        raise CtapError(0x01, f"unsupported command 0x{command:02x}")
 
     # ------------------------------------------------------------------ transmit
 

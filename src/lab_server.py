@@ -15,6 +15,8 @@ import os
 import secrets
 import subprocess
 import sys
+import threading
+import time
 
 from flask import Flask, jsonify, request, session
 
@@ -26,31 +28,68 @@ app.secret_key = secrets.token_bytes(32)
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lab_users.json")
 RP_ID = "lab.example"
-ORIGIN = f"https://{RP_ID}"
+ORIGIN = f"https://{RP_ID}:8443"
+app.config["WEBAUTHN_ORIGIN"] = ORIGIN
+DB_LOCK = threading.RLock()
+# ponytail: one process owns challenges and DB; use shared storage for multiple workers.
+PENDING_CHALLENGES = {}
+CHALLENGE_TTL = 300
+CHALLENGE_LOCK = threading.Lock()
 
 
 def load_db() -> dict:
-    if os.path.exists(DB_PATH):
-        with open(DB_PATH) as fh:
-            return json.load(fh)
-    return {}
+    with DB_LOCK:
+        if os.path.exists(DB_PATH):
+            with open(DB_PATH) as fh:
+                return json.load(fh)
+        return {}
 
 
 def save_db(db: dict):
-    with open(DB_PATH, "w") as fh:
-        json.dump(db, fh, indent=1)
-    os.chmod(DB_PATH, 0o600)
+    with DB_LOCK:
+        tmp = DB_PATH + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(db, fh, indent=1)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, DB_PATH)
+
+
+def update_db(mutator):
+    """Apply one read-modify-write transaction while holding the database lock."""
+    with DB_LOCK:
+        db = load_db()
+        result = mutator(db)
+        save_db(db)
+        return result, db
 
 
 def challenge() -> str:
     value = secrets.token_bytes(32)
-    session["challenge"] = base64.urlsafe_b64encode(value).decode().rstrip("=")
-    return session["challenge"]
+    encoded = base64.urlsafe_b64encode(value).decode().rstrip("=")
+    now = time.monotonic()
+    with CHALLENGE_LOCK:
+        for pending, expires in list(PENDING_CHALLENGES.items()):
+            if expires <= now or pending == session.get("challenge"):
+                PENDING_CHALLENGES.pop(pending, None)
+        PENDING_CHALLENGES[encoded] = now + CHALLENGE_TTL
+    session["challenge"] = encoded
+    return encoded
+
+
+def consume_challenge() -> bytes:
+    encoded = session.pop("challenge", None)
+    with CHALLENGE_LOCK:
+        expires = PENDING_CHALLENGES.pop(encoded, None)
+    if expires is None or expires <= time.monotonic():
+        raise RpError("missing, expired, or already-consumed ceremony challenge")
+    return base64.urlsafe_b64decode(encoded + "==")
 
 
 # --------------------------------------------------------------------------- page
 
-PAGE = """<!doctype html>
+PAGE = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>FIDO2 Lab RP</title>
 <style>
  body{font-family:ui-monospace,monospace;max-width:52rem;margin:2rem auto;padding:0 1rem}
@@ -181,7 +220,10 @@ def api_register():
     import cbor2
 
     body = request.get_json(force=True)
-    expected = base64.urlsafe_b64decode(session["challenge"] + "==")
+    try:
+        expected = consume_challenge()
+    except RpError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     client_data = base64.urlsafe_b64decode(body["response"]["clientDataJSON"] + "==")
     att_obj = base64.urlsafe_b64decode(body["response"]["attestationObject"] + "==")
 
@@ -191,21 +233,27 @@ def api_register():
         return jsonify({"ok": False, "error": f"attestationObject not CBOR: {exc}"}), 400
 
     try:
-        reg = verify_registration(RP_ID, client_data, parsed, expected)
+        reg = verify_registration(
+            RP_ID, client_data, parsed, expected,
+            expected_origin=app.config["WEBAUTHN_ORIGIN"],
+        )
     except RpError as exc:
         return jsonify({"ok": False, "error": str(exc),
                         "detail": "RP verification failed"}), 400
 
-    db = load_db()
-    db[base64.urlsafe_b64encode(reg["credential_id"]).decode()] = {
-        "public_key": base64.b64encode(reg["public_key_der"]).decode(),
-        "sign_count": reg["sign_count"],
-        "aaguid": reg["aaguid"].hex(),
-        "fmt": reg["fmt"],
-        "backup_eligible": reg["backup_eligible"],
-        "backup_state": reg["backup_state"],
-    }
-    save_db(db)
+    key = base64.urlsafe_b64encode(reg["credential_id"]).decode()
+
+    def store_registration(db):
+        db[key] = {
+            "public_key": base64.b64encode(reg["public_key_der"]).decode(),
+            "sign_count": reg["sign_count"],
+            "aaguid": reg["aaguid"].hex(),
+            "fmt": reg["fmt"],
+            "backup_eligible": reg["backup_eligible"],
+            "backup_state": reg["backup_state"],
+        }
+
+    _, db = update_db(store_registration)
 
     return jsonify({
         "ok": True,
@@ -225,35 +273,41 @@ def api_authenticate():
     import cbor2
 
     body = request.get_json(force=True)
-    expected = base64.urlsafe_b64decode(session["challenge"] + "==")
+    try:
+        expected = consume_challenge()
+    except RpError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     client_data = base64.urlsafe_b64decode(body["response"]["clientDataJSON"] + "==")
     auth_data = base64.urlsafe_b64decode(body["response"]["authenticatorData"] + "==")
     signature = base64.urlsafe_b64decode(body["response"]["signature"] + "==")
     raw_id = base64.urlsafe_b64decode(body["rawId"] + "==")
 
-    db = load_db()
     key = base64.urlsafe_b64encode(raw_id).decode()
-    record = db.get(key)
-    if not record:
-        return jsonify({"ok": False, "error": "unknown credential"}), 400
 
     assertion = {
-        1: raw_id,
+        1: {"type": "public-key", "id": raw_id},
         2: auth_data,
         3: signature,
         4: None,
     }
-    try:
-        res = verify_assertion(
+    def verify_and_advance(db):
+        record = db.get(key)
+        if not record:
+            raise RpError("unknown credential")
+        result = verify_assertion(
             RP_ID, client_data, assertion,
             base64.b64decode(record["public_key"]),
             record["sign_count"], expected,
+            expected_origin=app.config["WEBAUTHN_ORIGIN"],
         )
+        record["sign_count"] = result["sign_count"]
+        return result
+
+    try:
+        res, _ = update_db(verify_and_advance)
     except RpError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
 
-    record["sign_count"] = res["sign_count"]
-    save_db(db)
     return jsonify({"ok": True, "verified": True,
                     "sign_count": res["sign_count"],
                     "flags": f"0x{auth_data[32]:02x}"})
@@ -277,11 +331,12 @@ def ensure_cert():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8443)
-    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--host", default="127.0.0.1")
     args = ap.parse_args()
 
     cert, key = ensure_cert()
-    print(f"RP on https://{RP_ID}:{args.port}  (cert: {cert})")
+    app.config["WEBAUTHN_ORIGIN"] = f"https://{RP_ID}:{args.port}"
+    print(f"RP on {app.config['WEBAUTHN_ORIGIN']}  (cert: {cert})")
     print(f"add to /etc/hosts:  127.0.0.1  {RP_ID}")
     app.run(host=args.host, port=args.port,
             ssl_context=(cert, key), debug=False, threaded=True)
