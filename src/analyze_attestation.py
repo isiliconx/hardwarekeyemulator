@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import sys
 
 import cbor2
@@ -17,24 +18,44 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ec import ECDSA
 
-# AAGUIDs of real, FIDO-MDS-listed authenticator families. An RP that pins or
-# deny-lists AAGUIDs resolves the whole question without touching the network.
-# Genuine vendor attestation roots — real RPs load these from the FIDO MDS blob.
-KNOWN_FIDO_ATTESTATION_ISSUERS = {
-    "Yubico U2F EE", "Yubico U2F EE Serial", "Yubico Unified Attestation",
-    "Yubico", "Google Hardware Attestation", "Microsoft Corporation",
-    "Feitian Technologies", "SoloKeys", "Nitrokey",
-}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from vendor_profiles import YUBIKEY_AAGUIDS
+
+
+def _hex_aaguid(aaguid: str) -> str:
+    return aaguid.replace("-", "").strip().lower()
+
+
+# AAGUIDs of real, FIDO-MDS-listed authenticator families, keyed by the
+# dash-free hex form authData carries. An RP that allow-lists or deny-lists
+# AAGUIDs resolves the whole question without touching the network.
 KNOWN_AAGUIDS = {
-    "00000000000000000000000000000000": "self-attestation (AAGUID must be all-zero)",
-    "ee882879721776c68f8f4249af2df5e": "Yubico YubiKey 5 series",
-    "fa2b99dc9c939b41de6b2a6d56024f0b": "Yubico YubiKey 5 FIPS",
-    "cb69481e8a7f005a397e0088faf85d65": "Yubico Security Key",
-    "d8522d9f575b486688a9ba99fa02f35b": "Yubico YubiKey 5 NFC",
-    "b93fd961-f2e6-462f-b122-82002247de78": "Google Titan / Chrome (internal)",
-    "08987058-cadc-4b81-b6e1-30de50dcbe96": "Windows Hello hardware-backed",
-    "adce0002-35bc-c60a-648b-0b25f1f05503": "Chromium virtual authenticator",
+    "00000000000000000000000000000000":
+        "self-attestation (AAGUID must be all-zero)",
+    _hex_aaguid("01020304050607080102030405060708"):
+        "Chromium virtual authenticator (measured: Chrome 154/155/158)",
+}
+KNOWN_AAGUIDS.update(
+    {_hex_aaguid(aaguid): f"Yubico {model}"
+     for model, aaguid in YUBIKEY_AAGUIDS.items()}
+)
+
+# Genuine vendor attestation root names. Real RPs load the actual certificates
+# from the FIDO MDS blob and compare by fingerprint — the finding emitted when
+# a chain matches by NAME only says exactly that.
+KNOWN_FIDO_ATTESTATION_ISSUERS = {
+    "Yubico U2F Root CA Serial 457200631",
+    "Yubico Attestation Root 1",
+    "Yubico Attestation Intermediate",
+    "Yubico FIDO Attestation",
+    "Yubico U2F EE",
+    "Yubico",
+    "Google Hardware Attestation",
+    "Microsoft Corporation",
+    "Feitian Technologies",
+    "SoloKeys",
+    "Nitrokey",
 }
 
 
@@ -115,12 +136,24 @@ def inspect(attestation_response: dict, auth_data: bytes, client_data_hash: byte
                     findings.append({
                         "signal": "attestation chain terminates at an untrusted self-made CA",
                         "what_rp_sees": f"root CN={root_cn!r} — not a recognised FIDO "
-                                        "attestation root (Yubico, Google, Microsoft, ...)",
+                                        f"attestation root (Yubico, Google, Microsoft, ...)",
                         "rp_can_reject": True,
                         "how": "The chain can be structurally perfect — correct leaf, real "
                                "signature, FIDO extension present — and still prove nothing, "
                                "because the root is one this process generated itself. An RP "
                                "that pins FIDO MDS attestation roots rejects it here.",
+                    })
+                else:
+                    findings.append({
+                        "signal": "root NAME matches a known vendor CA",
+                        "what_rp_sees": f"root CN={root_cn!r}",
+                        "rp_can_reject": False,
+                        "how": "Name matches satisfy name-based checks. The one comparison "
+                               "that still separates a lab chain from the genuine article is "
+                               "the root's SHA-256 fingerprint / public key against the "
+                               "PINNED vendor root — exactly what rp_verify's "
+                               "trusted_attestation_root_sha256 policy enforces, and a "
+                               "locally generated chain fails it (no vendor private key).",
                     })
 
             if not report["aaguid_known"]:
