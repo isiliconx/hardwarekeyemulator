@@ -38,7 +38,12 @@ YUBIKEY_AAGUIDS = {
     "Security Key by Yubico": "f8a011f3-8c0a-4d15-8006-17111f9edc7d",
     "Security Key NFC by Yubico": "b7d3f68e-88a6-471e-9ecf-2df26d041ede",
     # A non-Yubico key, as a counter-example profile
-    "Feitian FIDO2 (BioPass K33)": "77010bd7-212a-4fc9-b236-d2ca5e9d4084",
+}
+
+# Real, non-Yubico AAGUIDs kept for reference. MDS-listed, but NOT on the
+# Daybreak allow-list: Thetis/TrustKey-class keys register as "Passkey" there.
+OTHER_VENDOR_AAGUIDS = {
+    "Feitian BioPass FIDO2 K33": "77010bd7-212a-4fc9-b236-d2ca5e9d4084",
 }
 
 # The default target for the OpenAI Daybreak problem: a key model that is known-good

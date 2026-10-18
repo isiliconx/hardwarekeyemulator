@@ -32,26 +32,45 @@ from cryptography.hazmat.primitives.asymmetric import ec
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from ctap2_core import FLAG_AT, FLAG_BE, FLAG_BS, FLAG_UP, FLAG_UV
+from vendor_profiles import OTHER_VENDOR_AAGUIDS, YUBIKEY_AAGUIDS
 
-# Roots a real RP pulls from the FIDO Metadata Service. A software authenticator
-# will never terminate at one of these, and that is the entire point of strategy D.
-FIDO_MDS_AAGUIDS = {
-    "f8a011f3-8c0a-4d15-8006-17111f9edc7d": "Yubico U2F EE",
-    "ee882879-721c-4913-9775-3dfcce97072a": "Yubico Unified Attestation",
-    "b93fd961-f2e6-462f-b122-82002247de21": "Yubkey 5",
-    "adce0002-35bc-c60a-648b-0b25f1f05503": "Feitian FIDO2",
-    "d8522d9f-fe0b-4232-9003-4de4b2588dea": "Google Titan",
-    "5343504c-4643-4581-37a5-52e28502fd34": "Microsoft",
-}
+
+def _aaguid_key(aaguid: str) -> str:
+    """Normalise an AAGUID to the dash-free hex form authData carries."""
+    return aaguid.replace("-", "").strip().lower()
+
+
+# Real AAGUIDs, read from the live FIDO MDS blob (mds.fidoalliance.org) and the
+# Yubico developer docs. A software authenticator cannot terminate its chain at
+# any of these vendors' real roots — that is the entire point of strategy D.
+# Built as {aaguid-hex: model} and normalised to the dash-free form
+# parse_attestation() produces.
+FIDO_MDS_AAGUIDS = {_aaguid_key(aaguid): model
+                    for model, aaguid in YUBIKEY_AAGUIDS.items()}
+FIDO_MDS_AAGUIDS.update({_aaguid_key(aaguid): model
+                         for model, aaguid in OTHER_VENDOR_AAGUIDS.items()})
+FIDO_MDS_AAGUIDS[_aaguid_key("01020304050607080102030405060708")] = \
+    "Chromium virtual authenticator (measured: Chrome 154/155/158)"
 
 FIDO_TRUSTED_ISSUERS = {
-    "Yubico U2F EE Serial 457200631",
-    "Yubico Unified Attestation",
+    "Yubico U2F Root CA Serial 457200631",
+    "Yubico Attestation Root 1",
+    "Yubico Attestation Intermediate",
+    "Yubico FIDO Attestation",
+    "Yubico U2F EE",
     "Yubico",
     "Feitian Technologies",
     "Google Hardware Attestation",
     "Microsoft Corporation",
 }
+
+# Strategy E — the shape OpenAI's Daybreak behaves like: a curated allow-list of
+# known-good hardware-key models keyed by AAGUID. Everything off the list lands
+# in the "Passkey" bucket — which is exactly what TrustKey T110/T120, Trezor,
+# Thetis and homebrew ESP32 keys all report in the wild, while YubiKeys register
+# as "Security key" (observed September–October 2026; see README).
+DAYBREAK_ALLOWLIST = {_aaguid_key(aaguid): model
+                      for model, aaguid in YUBIKEY_AAGUIDS.items()}
 
 POLICY_DEFAULT = {"require_attestation": True}
 
@@ -96,6 +115,30 @@ def verify_attestation_sig(auth_data: bytes, client_data_hash: bytes,
         return False, "signature does NOT verify"
 
 
+def classify_daybreak(parsed: dict, attachment: str = "cross-platform") -> dict:
+    """
+    The enforcement shape OpenAI's Daybreak behaves like: a credential counts
+    as a physical hardware key when its AAGUID is a known-good model AND it is
+    not backup-eligible AND it came from a roaming (cross-platform)
+    authenticator. Everything else lands in the "Passkey" bucket.
+    """
+    flags = parsed["flags"]
+    aaguid = parsed["aaguid"]
+    backup_eligible = bool(flags & FLAG_BE)
+    backup_state = bool(flags & FLAG_BS)
+    known = aaguid in DAYBREAK_ALLOWLIST
+    counts = known and not backup_eligible and attachment == "cross-platform"
+    return {
+        "counts_as_hardware_key": counts,
+        "label": "Security key" if counts else "Passkey",
+        "aaguid": aaguid,
+        "model": DAYBREAK_ALLOWLIST.get(aaguid, "UNRECOGNISED"),
+        "reason": f"aaguid_known={known} "
+                  f"({DAYBREAK_ALLOWLIST.get(aaguid, 'not in allow-list')}) "
+                  f"BE={backup_eligible} BS={backup_state} attachment={attachment}",
+    }
+
+
 def classify(parsed: dict, sig_ok: bool) -> dict:
     """
     Return the four verdicts independently. Each is a shape a real RP ships.
@@ -134,16 +177,24 @@ def classify(parsed: dict, sig_ok: bool) -> dict:
         "counts_as_hardware_key": bool(sig_ok and aaguid_ok and issuer_ok),
         "reason": f"sig_ok={sig_ok} aaguid_in_mds={aaguid_ok} issuer_trusted={issuer_ok}",
     }
+
+    # E - the Daybreak shape: model allow-list + roaming + non-syncable
+    daybreak = classify_daybreak(parsed)
+    verdicts["E_DAYBREAK"] = {
+        "counts_as_hardware_key": daybreak["counts_as_hardware_key"],
+        "reason": daybreak["reason"],
+    }
     return verdicts
 
 
-def build_demo_attestation():
-    """Produce a real packed attestation from the local lab CA: a genuine
-    signature from a real key, just not a vendor key."""
+def build_demo_attestation(profile=None):
+    """Produce a real packed attestation from the local CA: a genuine signature
+    from a real key, just not a vendor key. `profile` selects a vendor identity
+    (vendor_profiles.py); None keeps the anonymous lab key."""
     from ctap2_core import Ctap2Authenticator
     temporary = tempfile.TemporaryDirectory(prefix="policy-lab-")
     auth = Ctap2Authenticator(store_path=os.path.join(temporary.name, "creds.json"),
-                             uv_gate=lambda: True)
+                              profile=profile, uv_gate=lambda: True)
     challenge = os.urandom(32)
     client_data = json.dumps({
         "type": "webauthn.create",
@@ -204,7 +255,7 @@ def main():
     print(f"  fido aaguid ext : {parsed.get('has_aaguid_ext')}")
     print(f"  signature       : {sig_reason}")
 
-    print("\n-- four RP enforcement shapes, four verdicts --")
+    print("\n-- five RP enforcement shapes, five verdicts --")
     for name, v in classify(parsed, sig_ok).items():
         mark = "HARDWARE" if v["counts_as_hardware_key"] else "passkey"
         print(f"\n  {name}: {mark}")
@@ -227,10 +278,25 @@ def main():
                 else "<- correctly rejected: signature did not verify")
         print(f"  {name}: {mark}   {note}")
 
+    print("\n" + "=" * 74)
+    print(" SAME CLASSIFIER, TWO IDENTITIES: lab key vs vendor profile")
+    print("=" * 74)
+    for label, prof in (("lab", None), ("yubikey", "yubikey")):
+        d_auth, d_stmt, d_cd = build_demo_attestation(prof)
+        d_parsed = parse_attestation(d_auth, d_stmt.get("fmt", "packed"), d_stmt)
+        d_verdict = classify_daybreak(d_parsed)
+        print(f"\n  {label:8} aaguid={d_parsed['aaguid']}")
+        print(f"           OpenAI-style label: {d_verdict['label']}")
+        print(f"           {d_verdict['reason']}")
+
     print("\n-- bottom line --")
     print("  A/B/C : need no vendor key. A software key passes all three.")
     print("  D     : needs a signature under a FIDO-registered vendor root.")
     print("          Not reachable without that vendor private key. Arithmetic.")
+    print("  E     : the Daybreak shape — allow-list the AAGUID. A vendor profile")
+    print("          passes it; the lab key and Chromium's virtual authenticator")
+    print("          (aaguid 0102...08) do not. This is the shape that matches")
+    print("          observed OpenAI behaviour (TrustKey/Trezor/ESP32 -> Passkey).")
     print("  C     : broken by design when the signature is not verified. The")
     print("          forged case above is the demonstration: an RP that only")
     print("          checks 'attestation present' accepts a broken signature.")

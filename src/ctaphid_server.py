@@ -126,26 +126,44 @@ def main():
                     help="credential store path (persisted across restarts)")
     ap.add_argument("--attestation", default="packed_x5c",
                     choices=["none", "packed_self", "packed_x5c"])
-    ap.add_argument("--aaguid", default="00" * 16,
-                    help="16-byte AAGUID (hex) — all-zero means self-attestation")
+    ap.add_argument("--profile", default="yubikey",
+                    help="vendor identity from vendor_profiles.py; 'lab' keeps "
+                         "the anonymous lab key")
+    ap.add_argument("--aaguid", default=None,
+                    help="override the profile AAGUID (32 hex chars)")
     ap.set_defaults(touch_required=True)
     ap.add_argument("--no-touch-required", dest="touch_required", action="store_false",
                     help="UNSAFE: approve user presence without an operator gesture")
-    ap.add_argument("--internal-uv", action="store_true",
-                    help="assert software user verification after the presence prompt")
+    ap.add_argument("--internal-uv", dest="internal_uv", action="store_true",
+                    default=None,
+                    help="assert software user verification after the presence "
+                         "prompt (default: ON when a vendor profile is active)")
+    ap.add_argument("--no-internal-uv", dest="internal_uv", action="store_false",
+                    help="never claim or perform UV")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
+
+    from vendor_profiles import get_profile
+    profile = None
+    if args.profile and args.profile.strip().lower() != "lab":
+        profile = get_profile(args.profile)
+    aaguid = bytes.fromhex(args.aaguid.replace("-", "")) if args.aaguid else None
+    internal_uv = (args.internal_uv if args.internal_uv is not None
+                   else profile is not None)
 
     presence_gate = _presence_gate(args.touch_required)
     auth = Ctap2Authenticator(
         store_path=args.store,
         attestation_mode=args.attestation,
-        aaguid=bytes.fromhex(args.aaguid),
+        aaguid=aaguid,
+        profile=profile,
         up_gate=presence_gate,
-        uv_gate=presence_gate if args.internal_uv else None,
+        uv_gate=presence_gate if internal_uv else None,
     )
     print(f"[server] store={args.store} attestation={args.attestation} "
-          f"aaguid={args.aaguid}", flush=True)
+          f"aaguid={auth.aaguid.hex()}", flush=True)
+    if profile is not None:
+        print(f"[server] identity: {profile.describe()}", flush=True)
 
     if args.listen:
         try:
