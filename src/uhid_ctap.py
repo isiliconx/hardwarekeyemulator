@@ -137,6 +137,14 @@ REPORT_DESCRIPTOR = bytes([
 FIDO_VENDOR_ID = 0xF1D0
 FIDO_PRODUCT_ID = 0x0001
 
+# Yubico's real USB identity. VID 0x1050 is Yubico; PID 0x0407 is a YubiKey 5
+# series (incl. 5C NFC) with all interfaces enabled — the iProduct string for
+# that combination is "YubiKey OTP+FIDO+CCID". Used when a Yubico vendor profile
+# is active so the OS-level listing matches the AAGUID the RP will read.
+YUBICO_VENDOR_ID = 0x1050
+YUBICO_PRODUCT_ID = 0x0407
+YUBICO_PRODUCT_NAME = "YubiKey OTP+FIDO+CCID"
+
 
 class UhidTransport(HidTransport):
     """
@@ -148,11 +156,20 @@ class UhidTransport(HidTransport):
     discovers it with no browser-side cooperation whatsoever.
     """
 
-    def __init__(self, device: str = "/dev/uhid"):
+    def __init__(self, device: str = "/dev/uhid", name: str = "Lab FIDO2 CTAP2 Key",
+                 phys: str = "lab-fido2/uhid", uniq: str = "lab-fido2-ctap2",
+                 vendor: int = FIDO_VENDOR_ID, product: int = FIDO_PRODUCT_ID,
+                 version: int = 0x0001, country: int = 0):
         super().__init__()
         self.device = device
         self.fd = None
-        self.name = "Lab FIDO2 CTAP2 Key"
+        self.name = name
+        self.phys = phys
+        self.uniq = uniq
+        self.vendor = vendor
+        self.product = product
+        self.version = version
+        self.country = country
         self._opened = threading.Event()
         self.stop = threading.Event()
 
@@ -167,13 +184,13 @@ class UhidTransport(HidTransport):
         try:
             self._send_event(uhid_create2_event(
                 name=self.name,
-                phys="lab-fido2/uhid",
-                uniq="lab-fido2-ctap2",
+                phys=self.phys,
+                uniq=self.uniq,
                 bus=BUS_USB,
-                vendor=FIDO_VENDOR_ID,
-                product=FIDO_PRODUCT_ID,
-                version=0x0001,
-                country=0,
+                vendor=self.vendor,
+                product=self.product,
+                version=self.version,
+                country=self.country,
                 report_descriptor=REPORT_DESCRIPTOR,
             ))
             self._await(UHID_START)
@@ -280,6 +297,8 @@ def check_uhid(device: str = "/dev/uhid") -> Optional[str]:
 
 
 def main():
+    from vendor_profiles import get_profile
+
     ap = argparse.ArgumentParser(
         description="Expose the CTAP2 emulator as an OS-level FIDO security key "
                     "over /dev/uhid, so any browser finds it natively.")
@@ -287,20 +306,39 @@ def main():
     ap.add_argument("--store", default="./creds.json")
     ap.add_argument("--attestation", default="packed_x5c",
                     choices=["none", "packed_self", "packed_x5c"])
+    ap.add_argument("--profile", default="yubikey",
+                    help="vendor identity from vendor_profiles.py (name or alias). "
+                         "Default 'yubikey' -> YubiKey 5C NFC fw 5.7.4+; 'lab' "
+                         "keeps the original anonymous lab key.")
+    ap.add_argument("--aaguid", default=None,
+                    help="override the profile AAGUID (32 hex chars)")
     ap.set_defaults(touch_required=True)
     ap.add_argument("--no-touch-required", dest="touch_required", action="store_false",
                     help="UNSAFE: approve user presence without an operator gesture")
-    ap.add_argument("--internal-uv", action="store_true",
-                    help="assert software user verification after the presence prompt")
+    ap.add_argument("--internal-uv", dest="internal_uv", action="store_true",
+                    default=None,
+                    help="assert software user verification after the presence "
+                         "prompt (default: ON when a vendor profile is active)")
+    ap.add_argument("--no-internal-uv", dest="internal_uv", action="store_false",
+                    help="never claim or perform UV — strict AAS/Daybreak flows "
+                         "ask userVerification:'required', so leave UV on")
     args = ap.parse_args()
+
+    profile = None
+    if args.profile and args.profile.strip().lower() != "lab":
+        profile = get_profile(args.profile)
+    aaguid = bytes.fromhex(args.aaguid.replace("-", "")) if args.aaguid else None
+    internal_uv = (args.internal_uv if args.internal_uv is not None
+                   else profile is not None)
 
     reason = check_uhid(args.device)
     if reason:
         print(f"[uhid] NOT AVAILABLE: {reason}")
-        print("\nThis container's kernel has no uhid driver, so the HID binding "
-              "cannot be exercised here. Everything above the HID layer is "
-              "covered by the test suites; run this on a host with "
-              "CONFIG_INPUT_UHID=y.")
+        print("\nThis kernel has no uhid driver, so the HID binding cannot run "
+              "here. Everything above the HID layer is covered by the test "
+              "suites; run this on a host with CONFIG_INPUT_UHID=y (or WSL2, "
+              "where `sudo modprobe uhid` works). daybreak_check.py exercises "
+              "the identity half with no kernel support at all.")
         return 1
 
     from ctap2_core import Ctap2Authenticator
@@ -309,11 +347,25 @@ def main():
     auth = Ctap2Authenticator(
         store_path=args.store,
         attestation_mode=args.attestation,
+        aaguid=aaguid,
+        profile=profile,
         up_gate=presence_gate,
-        uv_gate=presence_gate if args.internal_uv else None,
+        uv_gate=presence_gate if internal_uv else None,
     )
 
-    transport = UhidTransport(args.device)
+    is_yubico = profile is not None and profile.cert_org == "Yubico AB"
+    if profile is not None:
+        transport = UhidTransport(
+            args.device,
+            name=YUBICO_PRODUCT_NAME if is_yubico else profile.model,
+            phys="uhid-fido2",
+            uniq=profile.aaguid.replace("-", "")[:16],
+            vendor=YUBICO_VENDOR_ID if is_yubico else FIDO_VENDOR_ID,
+            product=YUBICO_PRODUCT_ID if is_yubico else FIDO_PRODUCT_ID,
+            version=profile.firmware_version,
+        )
+    else:
+        transport = UhidTransport(args.device)
     try:
         transport.open()
     except Exception as exc:
@@ -323,12 +375,25 @@ def main():
     print(f"[uhid] {transport.name} bound")
     print(f"[uhid] usage page 0x{FIDO_USAGE_PAGE:04X}, usage 0x{FIDO_USAGE:02X}")
     print(f"[uhid] report {REPORT_SIZE} bytes, vid:pid "
-          f"{FIDO_VENDOR_ID:04x}:{FIDO_PRODUCT_ID:04x}")
-    print(f"[uhid] store={args.store} attestation={args.attestation}")
+          f"{transport.vendor:04x}:{transport.product:04x}")
+    if profile is not None:
+        print(f"[uhid] identity : {profile.describe()}")
+        print(f"[uhid] GetInfo  : versions={auth.get_info()[1]} "
+              f"transports={list(profile.transports)} "
+              f"fw={hex(profile.firmware_version)}")
+        print("[uhid] RP sees  : a real, MDS-listed AAGUID plus a "
+              "vendor-shaped attestation chain")
+        print("[uhid] NOTE     : the chain is signed by a LOCAL root — an RP "
+              "that pins the genuine vendor root still rejects it; that check "
+              "needs the vendor private key.")
+    else:
+        print("[uhid] identity : anonymous lab key (profile 'lab')")
+    print(f"[uhid] store={args.store} attestation={args.attestation} "
+          f"uv={'on' if internal_uv else 'off'}")
     print("\n  Enumerating as a native security key. Open any browser, go to your "
           "site, and\n  pick the USB security key. No browser flags involved.\n")
     print("  Verify the OS sees it:")
-    print("    lsusb | grep -i fido")
+    print(f"    lsusb | grep -i {'yubico' if is_yubico else 'fido'}")
     print("    cat /sys/class/hid/hidraw*/device/uevent | grep HID_NAME\n")
 
     from ctaphid import CtapHidDeviceSide

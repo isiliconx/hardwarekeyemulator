@@ -18,6 +18,17 @@ GADGET_DIR="/sys/kernel/config/usb_gadget/fido_key"
 HIDG=/dev/hidg0
 PID=fido
 
+# USB identity. Defaults are the FIDO Alliance demo VID/PID. For a vendor
+# profile, run e.g.:
+#   HKE_VENDOR_ID=0x1050 HKE_PRODUCT_ID=0x0407 \
+#   HKE_PRODUCT='YubiKey OTP+FIDO+CCID' HKE_MANUFACTURER='Yubico AB' \
+#   HKE_SERIAL='26035104' ./hid_gadget.sh
+VENDOR_ID="${HKE_VENDOR_ID:-0xf1d0}"
+PRODUCT_ID="${HKE_PRODUCT_ID:-0x0001}"
+PRODUCT_STR="${HKE_PRODUCT:-Lab Security Key}"
+MANUFACTURER_STR="${HKE_MANUFACTURER:-Lab Instruments}"
+SERIAL_STR="${HKE_SERIAL:-Lab FIDO2 CTAPHID Key}"
+
 usage() { echo "usage: $0 [start|stop]"; exit 1; }
 [ $# -ge 1 ] || usage
 
@@ -66,15 +77,15 @@ cd "$GADGET_DIR"
 
 # idVendor 0xf1d0 / idProduct 0x0001 — the FIDO Alliance's own demo VID/PID,
 # so hosts enumerate it as a FIDO device rather than a generic HID.
-echo 0xf1d0 > idVendor
-echo 0x0001 > idProduct
+echo "$VENDOR_ID" > idVendor
+echo "$PRODUCT_ID" > idProduct
 echo 0x0100 > bcdDevice
 echo 0x0100 > bcdUSB
 
 mkdir -p strings/0x409
-echo "Lab FIDO2 CTAPHID Key" > strings/0x409/serialnumber
-echo "Lab Security Key" > strings/0x409/product
-echo "Lab Instruments" > strings/0x409/manufacturer
+echo "$SERIAL_STR" > strings/0x409/serialnumber
+echo "$PRODUCT_STR" > strings/0x409/product
+echo "$MANUFACTURER_STR" > strings/0x409/manufacturer
 
 mkdir -p os_desc
 echo 1 > os_desc/bDeviceClass
@@ -112,7 +123,7 @@ sleep 1
 
 echo
 echo "gadget bound to UDC $UDC"
-echo "  vid:pid  0f1d:0001 (FIDO Alliance demo VID/PID)"
+echo "  vid:pid  $(printf '%04x' "$VENDOR_ID"):$(printf '%04x' "$PRODUCT_ID")"
 echo "  usage    FIDO page 0xF1D0 / usage 0x01"
 echo "  report   64 bytes, CTAPHID framing"
 echo "  device   $HIDG"
