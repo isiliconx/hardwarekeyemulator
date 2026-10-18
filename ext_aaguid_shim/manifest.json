@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "HKE AAGUID Shim",
+  "version": "1.0.0",
+  "description": "Rewrites the AAGUID in WebAuthn registrations (hardware-key emulator lab). Configure the model at the top of shim.js.",
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["shim.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    }
+  ]
+}
