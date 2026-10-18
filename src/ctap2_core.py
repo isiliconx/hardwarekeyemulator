@@ -230,68 +230,121 @@ def _credential_from_json(d: dict) -> Credential:
 @dataclass
 class AttestationCa:
     """
-    A local attestation chain. Deliberately NOT a real vendor CA — the analyser exists
-    precisely to show an RP can tell the difference. See analyze_attestation.py.
+    A local attestation chain, optionally shaped like a vendor's.
 
-    The root is a real self-signed CA; the leaf is issued *by* that root and wraps
-    the credential public key, exactly as a packed/x5c attestation should. It is a
-    **local** CA, so its root is not in any trust store — which is the honest answer
-    to the "can this pass as a YubiKey" question: no, and rp_verify says so out loud.
+    Vendor mode: three levels — leaf (wraps the credential key), intermediate
+    ("batch") CA, root — every subject written the way the vendor writes it, with
+    the FIDO AAGUID extension on the leaf. The keys are still ours: a *pinned*
+    vendor root cannot verify our chain (vendor private key — arithmetic), but
+    every name, shape, extension and cross-signature is a faithful copy. Lab mode
+    keeps the original single root + "Batch Attestation" leaf unchanged.
     """
 
     root_cert_der: bytes
     root_key_pem: str
     aaguid: bytes
     root_subject: str = ""
+    vendor_mode: bool = False
+    intermediate_cert_der: bytes = b""
+    intermediate_key_pem: str = ""
+    leaf_name: Optional[tuple] = None      # (C, O, OU, CN) or None for lab naming
+    profile_name: Optional[str] = None
 
     @staticmethod
-    def generate(common_name: str, aaguid: bytes) -> "AttestationCa":
+    def generate(common_name: str, aaguid: bytes,
+                 profile: Optional[object] = None) -> "AttestationCa":
+        """
+        Build the chain. `common_name` is the lab root CN; `profile` (a
+        vendor_profiles.VendorProfile) overrides naming and adds a level.
+        """
+        root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        now = _now()
+        if profile is not None:
+            root_name = x509_vendor_name(profile.cert_country, profile.cert_org,
+                                         None, profile.root_cn_hint)
+            leaf_name = tuple(profile.subject())
+        else:
+            root_name = x509_name(common_name)
+            leaf_name = None
+
+        root = (
+            x509_builder()
+            .subject_name(root_name)
+            .issuer_name(root_name)          # self-signed root
+            .public_key(root_key.public_key())
+            .serial_number(x509_random_serial())
+            .not_valid_before(now - _days(1))
+            .not_valid_after(now + _days(3650))
+            .add_extension(
+                basic_constraints(True, path_length=1 if leaf_name else None),
+                critical=True)
+            .add_extension(key_usage(ca=True), critical=True)
+            .sign(root_key, hashes.SHA256())
+        )
+        ca = AttestationCa(
+            root_cert_der=root.public_bytes(serialization.Encoding.DER),
+            root_key_pem=_key_pem(root_key),
+            aaguid=aaguid,
+            root_subject=root_name.rfc4514_string(),
+            vendor_mode=leaf_name is not None,
+            leaf_name=leaf_name,
+            profile_name=getattr(profile, "name", None),
+        )
+        if leaf_name is not None and getattr(profile, "intermediate_cn", None):
+            ca._issue_intermediate(profile, root_key, root)
+        return ca
+
+    def _issue_intermediate(self, profile, root_key, root_cert) -> None:
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        subject = x509_name(common_name)
+        name = x509_vendor_name(profile.cert_country, profile.cert_org,
+                                None, profile.intermediate_cn)
         now = _now()
         cert = (
             x509_builder()
-            .subject_name(subject)
-            .issuer_name(subject)          # self-signed root
+            .subject_name(name)
+            .issuer_name(root_cert.subject)
             .public_key(key.public_key())
             .serial_number(x509_random_serial())
             .not_valid_before(now - _days(1))
             .not_valid_after(now + _days(3650))
-            .add_extension(basic_constraints(True), critical=True)
-            .sign(key, hashes.SHA256())
+            .add_extension(basic_constraints(True, path_length=0), critical=True)
+            .add_extension(key_usage(ca=True), critical=True)
+            .sign(root_key, hashes.SHA256())
         )
-        return AttestationCa(
-            root_cert_der=cert.public_bytes(serialization.Encoding.DER),
-            root_key_pem=key.private_bytes(
-                serialization.Encoding.PEM,
-                serialization.PrivateFormat.PKCS8,
-                serialization.NoEncryption(),
-            ).decode(),
-            aaguid=aaguid,
-            root_subject=subject.rfc4514_string(),
-        )
+        self.intermediate_cert_der = cert.public_bytes(serialization.Encoding.DER)
+        self.intermediate_key_pem = _key_pem(key)
 
     def issue_leaf(self, credential_pub_der: bytes, serial: int) -> bytes:
         """
-        Batch attestation certificate: subject = credential key, issuer = our root.
-        Carries the FIDO AAGUID extension (1.3.6.1.4.1.45724.1.1.4) the way vendor
-        certificates do, so the only remaining tell is that the issuer is not a
-        recognised vendor — which is exactly the check an RP must make.
+        Attestation certificate for one credential. Vendor mode names it the way
+        the vendor names batch certificates (serial in the CN); verified by the
+        intermediate when one exists. Carries id-fido-gen-ce-aaguid so the leaf's
+        AAGUID matches authData, exactly as vendor certificates do.
         """
-        key = serialization.load_pem_private_key(self.root_key_pem.encode(), password=None)
-        root = _certlib().load_der_x509_certificate(self.root_cert_der)
+        if self.intermediate_key_pem:
+            signer = serialization.load_pem_private_key(
+                self.intermediate_key_pem.encode(), password=None)
+            issuer = _certlib().load_der_x509_certificate(
+                self.intermediate_cert_der).subject
+        else:
+            signer = serialization.load_pem_private_key(
+                self.root_key_pem.encode(), password=None)
+            issuer = _certlib().load_der_x509_certificate(self.root_cert_der).subject
+        subject = (x509_vendor_name(*self.leaf_name) if self.leaf_name
+                   else x509_name("Batch Attestation"))
         now = _now()
         return (
             x509_builder()
-            .subject_name(x509_name("Batch Attestation"))
-            .issuer_name(root.subject)        # issued BY the root, not itself
+            .subject_name(subject)
+            .issuer_name(issuer)
             .public_key(serialization.load_der_public_key(credential_pub_der))
             .serial_number(serial or x509_random_serial())
             .not_valid_before(now - _days(1))
-            .not_valid_after(now + _days(365))
+            .not_valid_after(now + _days(3650 if self.vendor_mode else 365))
             .add_extension(basic_constraints(False), critical=True)
+            .add_extension(key_usage(ca=False), critical=True)
             .add_extension(fido_aaguid_extension(self.aaguid), critical=False)
-            .sign(key, hashes.SHA256())
+            .sign(signer, hashes.SHA256())
         ).public_bytes(serialization.Encoding.DER)
 
 
@@ -325,14 +378,44 @@ def x509_name(cn: str):
     ])
 
 
+def x509_vendor_name(country: str, org: str, ou: Optional[str], cn: str):
+    """Vendor-style DN: C, O, [OU], CN — the attribute set vendors actually write."""
+    x = _certlib()
+    parts = [
+        x.NameAttribute(x.oid.NameOID.COUNTRY_NAME, country),
+        x.NameAttribute(x.oid.NameOID.ORGANIZATION_NAME, org),
+    ]
+    if ou is not None:
+        parts.append(x.NameAttribute(x.oid.NameOID.ORGANIZATIONAL_UNIT_NAME, ou))
+    parts.append(x.NameAttribute(x.oid.NameOID.COMMON_NAME, cn))
+    return x.Name(parts)
+
+
 def x509_builder():
     x = _certlib()
     return x.CertificateBuilder()
 
 
-def basic_constraints(is_ca: bool):
+def basic_constraints(is_ca: bool, path_length: Optional[int] = None):
     x = _certlib()
-    return x.BasicConstraints(ca=is_ca, path_length=None)
+    return x.BasicConstraints(ca=is_ca, path_length=path_length)
+
+
+def key_usage(ca: bool):
+    x = _certlib()
+    return x.KeyUsage(
+        digital_signature=True, content_commitment=False, key_encipherment=False,
+        data_encipherment=False, key_agreement=False, key_cert_sign=ca,
+        crl_sign=ca, encipher_only=False, decipher_only=False,
+    )
+
+
+def _key_pem(key) -> str:
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
 
 
 def fido_aaguid_extension(aaguid: bytes):
@@ -372,7 +455,8 @@ class Ctap2Authenticator:
     """
 
     store_path: str
-    aaguid: bytes = b"\x00" * 16
+    aaguid: Optional[bytes] = None         # explicit override; None = profile default
+    profile: Optional[object] = None       # vendor_profiles name or VendorProfile
     attestation_mode: str = "packed_x5c"   # none | packed_self | packed_x5c
     up_gate: Callable[[], bool] = lambda: True
     uv_gate: Optional[Callable[[], bool]] = None
@@ -384,17 +468,33 @@ class Ctap2Authenticator:
     _ca: Optional[AttestationCa] = None
     _uv_blocked: bool = False
     pin_uv_auth_protocols: tuple = (2, 1)
+    _resolved_profile: Optional[object] = None
+    _explicit_aaguid: Optional[bytes] = None
 
     # ---------------------------------------------------------------- lifecycle
 
     def __post_init__(self):
+        if self.profile is not None:
+            from vendor_profiles import get_profile, VendorProfile
+            self._resolved_profile = (
+                self.profile if isinstance(self.profile, VendorProfile)
+                else get_profile(str(self.profile))
+            )
+        self._explicit_aaguid = self.aaguid
         self.load()
 
     def load(self):
-        if os.path.exists(self.store_path):
-            import json
-            from base64 import b64decode
+        """
+        Read the store. Identity rules: a fresh store gets the requested profile
+        (or the lab default); an existing store keeps its identity unless the
+        caller explicitly switched profiles or overrode the AAGUID — credentials
+        survive identity changes (assertions never carry the AAGUID).
+        """
+        import json
+        from base64 import b64decode
 
+        blob = {}
+        if os.path.exists(self.store_path):
             with open(self.store_path) as fh:
                 blob = json.load(fh)
             self._pin_hash = b64decode(blob["pin_hash"]) if blob.get("pin_hash") else None
@@ -408,9 +508,41 @@ class Ctap2Authenticator:
                     root_cert_der=b64decode(blob["ca_cert"]),
                     root_key_pem=blob["ca_key"],
                     aaguid=b64decode(blob["aaguid"]),
+                    root_subject=blob.get("ca_root_subject", ""),
+                    vendor_mode=blob.get("ca_vendor_mode", False),
+                    intermediate_cert_der=(b64decode(blob["ca_intermediate_cert"])
+                                           if blob.get("ca_intermediate_cert") else b""),
+                    intermediate_key_pem=blob.get("ca_intermediate_key") or "",
+                    leaf_name=(tuple(blob["ca_leaf_name"]) if blob.get("ca_leaf_name") else None),
+                    profile_name=blob.get("profile"),
                 )
-        if self._ca is None:
-            self._ca = AttestationCa.generate("Batch Certificate", self.aaguid)
+
+        regenerate = False
+        if self._ca is not None:
+            if (self._resolved_profile is not None
+                    and self._resolved_profile.name != blob.get("profile")):
+                regenerate = True
+            if (self._explicit_aaguid is not None
+                    and self._explicit_aaguid != self._ca.aaguid):
+                regenerate = True
+
+        if regenerate or self._ca is None:
+            wanted = self._explicit_aaguid or (
+                self._resolved_profile.aaguid_bytes() if self._resolved_profile
+                else b"\x00" * 16)
+            self._ca = AttestationCa.generate(
+                "Batch Certificate", wanted, profile=self._resolved_profile)
+            if not blob:
+                try:
+                    self.save()          # persist the fresh identity immediately
+                except OSError:
+                    pass
+        elif self._resolved_profile is None and self._ca.profile_name:
+            from vendor_profiles import get_profile
+            try:
+                self._resolved_profile = get_profile(self._ca.profile_name)
+            except KeyError:
+                self._resolved_profile = None
         self.aaguid = self._ca.aaguid
 
     def save(self):
@@ -424,9 +556,16 @@ class Ctap2Authenticator:
             "pin_retries": self._pin_retries,
             "uv_retries": self._uv_retries,
             "uv_blocked": self._uv_blocked,
+            "profile": self._ca.profile_name,
             "aaguid": b64encode(self._ca.aaguid).decode(),
             "ca_cert": b64encode(self._ca.root_cert_der).decode(),
             "ca_key": self._ca.root_key_pem,
+            "ca_root_subject": self._ca.root_subject,
+            "ca_vendor_mode": self._ca.vendor_mode,
+            "ca_intermediate_cert": (b64encode(self._ca.intermediate_cert_der).decode()
+                                     if self._ca.intermediate_cert_der else None),
+            "ca_intermediate_key": self._ca.intermediate_key_pem or None,
+            "ca_leaf_name": list(self._ca.leaf_name) if self._ca.leaf_name else None,
             "credentials": {cid.hex(): _credential_to_json(c)
                             for cid, c in self._credentials.items()},
         }
@@ -488,7 +627,7 @@ class Ctap2Authenticator:
         }
         if self.uv_gate is not None:
             options["uv"] = True
-        return {
+        info = {
             1: ["FIDO_2_0"],
             2: [],
             3: self.aaguid,
@@ -498,6 +637,18 @@ class Ctap2Authenticator:
             8: 64,
             10: [{"type": "public-key", "alg": ALG_ES256}],
         }
+        profile = self._resolved_profile
+        if profile is not None:
+            # *vendor fidelity: the GetInfo a real key of this model actually reports*
+            info[1] = ["FIDO_2_0", "FIDO_2_1", "U2F_V2"]
+            info[2] = ["credBlob", "credProtect", "hmac-secret", "largeBlobKey",
+                       "minPinLength"]
+            info[4].update({"plat": False, "clientPin": False})
+            info[6] = [2, 1]
+            info[9] = list(profile.transports)
+            info[0x0D] = 4
+            info[0x0E] = profile.firmware_version
+        return info
 
     def reset(self):
         self._up()
@@ -618,10 +769,14 @@ class Ctap2Authenticator:
             }
         leaf = self._ca.issue_leaf(cred.public_key_der(), serial=len(self._credentials))
         sig = key.sign(auth_data_with_hash, ec.ECDSA(hashes.SHA256()))
+        chain = [leaf]
+        if self._ca.intermediate_cert_der:
+            chain.append(self._ca.intermediate_cert_der)
+        chain.append(self._ca.root_cert_der)
         return "packed", {
             "alg": ALG_ES256,
             "sig": sig,
-            "x5c": [leaf, self._ca.root_cert_der],
+            "x5c": chain,
         }
 
     def get_assertion(self, req: dict) -> dict:
@@ -756,6 +911,7 @@ class Ctap2Authenticator:
             "pin_retries": self._pin_retries,
             "uv_blocked": self._uv_blocked,
             "aaguid": self._ca.aaguid.hex(),
+            "profile": self._ca.profile_name,
             "attestation_mode": self.attestation_mode,
             "up_gate": getattr(self.up_gate, "__name__", "lambda"),
             "uv_gate": getattr(self.uv_gate, "__name__", "lambda"),

@@ -9,3 +9,5 @@ lab.key
 lab_users.json
 *.tar.gz
 .pytest_cache/
+.refs/
+*.log
