@@ -56,7 +56,7 @@ Those first three are **one comparison each**. A site that pins FIDO MDS attesta
 roots, or checks the AAGUID against the metadata blob, rejects this device at
 registration — before any assertion is ever signed.
 
-**Update (this branch):** the first two comparisons are now *satisfied* — the
+**Update:** the first two comparisons are now *satisfied* — the
 AAGUID is a real, MDS-listed model and the leaf carries the FIDO extension.
 The third is satisfied by name and shape but not by key: a fingerprint-pinned
 vendor root still rejects, because that signature needs the vendor private
@@ -81,7 +81,7 @@ keys are all genuine roaming authenticators) and not an attestation-chain
 check ("no MDS or attestation requirement", per OpenAI support).
 `policy_lab.py` strategy **E** models exactly this shape.
 
-This branch makes the emulator carry a *real* vendor identity — every part an
+These changes make the emulator carry a *real* vendor identity — every part an
 RP can actually read:
 
 | Signal | Before | Now (vendor profile) |
@@ -113,6 +113,15 @@ the attestationObject the page receives:
 ```bash
 google-chrome --remote-debugging-port=9222 …   # your normal Chrome
 python3 src/hold_aaguid.py                     # resident; new tabs covered
+```
+
+For the full Chrome-only enrollment in ONE command — virtual authenticator
+plus AAGUID rewrite held together for the tab you enroll in (this is the
+tool to use on a machine with no other authenticator at all):
+
+```bash
+python3 src/hold_daybreak.py --tab chatgpt      # waits for the tab, then
+                                                 # holds key + identity
 ```
 
 …or install `ext_aaguid_shim/` as an unpacked extension (chrome://extensions →
@@ -189,6 +198,7 @@ automated tests; this does not prove browser or kernel interoperability.
 | `daybreak_check.py` | Pre-flight: will a Daybreak-shaped RP file this key as "Security key"? |
 | `aaguid_shim.js` | Page-world AAGUID rewrite for the Chrome-only path (no uhid / pinned CDP AAGUID) |
 | `hold_aaguid.py` | CDP holder that injects the shim into your real Chrome |
+| `hold_daybreak.py` | One-command enrollment: virtual authenticator + AAGUID shim held for one tab |
 | `ext_aaguid_shim/` | The same shim as an unpacked Chrome extension |
 | `hid_gadget.sh` | USB HID gadget descriptor on the FIDO usage page (env-overridable identity) |
 | `uhid_ctap.py` | **Any-browser path** — binds the key to the OS via `/dev/uhid` (`--profile`) |
